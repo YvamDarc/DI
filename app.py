@@ -1,5 +1,7 @@
 # app_admin.py — Admin only (FEC -> questions tabulaires par sous-compte)
 # Colonnes: N°, Date, Libellé, Question, Montant, Pièce, Statut, Sous-compte, Groupe
+# Comptes: 401 (fournisseurs), 411 (clients), 47* (comptes d'attente)
+# Texte adapté selon sens Débit/Crédit pour chaque catégorie
 # Édition via st.data_editor, suppression, renumérotation, export JSON/Excel
 # st.query_params + parsing dates robuste
 
@@ -36,37 +38,39 @@ def _empty(s: pd.Series):
     return s.isna() | (s.astype(str).str.strip() == "")
 
 def _to_naive_datetime(series: pd.Series) -> pd.Series:
+    # Parse en tz-aware UTC puis enlève le tz -> naïf
     s = pd.to_datetime(series, errors="coerce", utc=True)
     return s.dt.tz_localize(None)
 
-def _amount_series(df: pd.DataFrame, cDebit: Optional[str], cCredit: Optional[str]) -> pd.Series:
+def _amount_series_abs(df: pd.DataFrame, cDebit: Optional[str], cCredit: Optional[str]) -> pd.Series:
+    """Montant absolu (utile pour seuils lisibles)."""
     def to_num(s):
         if s.dtype == object:
             s = s.str.replace(",", ".", regex=False)
-        return pd.to_numeric(s, errors="coerce")
+        return pd.to_numeric(s, errors="coerce").fillna(0.0)
     if cDebit and cDebit in df.columns and cCredit and cCredit in df.columns:
-        d = to_num(df[cDebit]).fillna(0.0)
-        c = to_num(df[cCredit]).fillna(0.0)
+        d = to_num(df[cDebit])
+        c = to_num(df[cCredit])
         return (d - c).abs()
     elif cDebit and cDebit in df.columns:
-        return to_num(df[cDebit]).abs().fillna(0.0)
+        return to_num(df[cDebit]).abs()
     elif cCredit and cCredit in df.columns:
-        return to_num(df[cCredit]).abs().fillna(0.0)
+        return to_num(df[cCredit]).abs()
     else:
         return pd.Series(0.0, index=df.index)
 
-def read_fec_autodetect(uploaded_file) -> pd.DataFrame:
-    try:
-        return pd.read_csv(uploaded_file, sep=None, engine="python", dtype=str)
-    except Exception:
-        try: uploaded_file.seek(0)
-        except Exception: pass
-    try:
-        return pd.read_csv(uploaded_file, sep=";", dtype=str)
-    except Exception:
-        try: uploaded_file.seek(0)
-        except Exception: pass
-    return pd.read_excel(uploaded_file)
+def _signed_amount_series(df: pd.DataFrame, cDebit: Optional[str], cCredit: Optional[str]) -> pd.Series:
+    """Montant signé : >0 Débit, <0 Crédit."""
+    def to_num(s):
+        if s.dtype == object:
+            s = s.str.replace(",", ".", regex=False)
+        return pd.to_numeric(s, errors="coerce").fillna(0.0)
+    d = to_num(df[cDebit]) if (cDebit and cDebit in df.columns) else pd.Series(0.0, index=df.index)
+    c = to_num(df[cCredit]) if (cCredit and cCredit in df.columns) else pd.Series(0.0, index=df.index)
+    return d - c
+
+def _sens_from_signed(x: float) -> str:
+    return "Débit" if (x or 0) > 0 else ("Crédit" if (x or 0) < 0 else "N/A")
 
 def _fmt(s, missing=""):
     s = "" if s is None else str(s).strip()
@@ -75,8 +79,68 @@ def _fmt(s, missing=""):
 def _detect_group(compte: str) -> str:
     if compte.startswith("401"): return "Fournisseurs (401)"
     if compte.startswith("411"): return "Clients (411)"
-    if compte.startswith("471"): return "Comptes d'attente (471)"
+    if compte.startswith("47"):  return "Comptes d'attente (47)"
     return "Autres"
+
+def read_fec_autodetect(uploaded_file) -> pd.DataFrame:
+    # 1) CSV auto-sep
+    try:
+        return pd.read_csv(uploaded_file, sep=None, engine="python", dtype=str)
+    except Exception:
+        try: uploaded_file.seek(0)
+        except Exception: pass
+    # 2) CSV ;
+    try:
+        return pd.read_csv(uploaded_file, sep=";", dtype=str)
+    except Exception:
+        try: uploaded_file.seek(0)
+        except Exception: pass
+    # 3) Excel
+    return pd.read_excel(uploaded_file)
+
+# ----------------- Texte de question adapté (compte & sens) -----------------
+def _question_text_for(compte: str, sens: str, cas: str) -> str:
+    """
+    compte: '401...', '411...', '47...'
+    sens: 'Débit' | 'Crédit' | 'N/A'
+    cas: 'non_letre' | 'sans_piece' | 'doublon' | 'attente'
+    """
+    if compte.startswith("401"):
+        if cas == "non_letre":
+            return ("Fournisseur – poste non lettré ancien. "
+                    + ("(Crédit 401 = facture reçue). " if sens=="Crédit" else "(Débit 401 = règlement/avoir/avance). ")
+                    + "Merci de préciser le statut (litige, relance, avoir, plan de règlement) et joindre la pièce si disponible.")
+        if cas == "sans_piece":
+            return "Fournisseur – pièce absente : merci de fournir la facture/l’avoir/le relevé correspondant."
+        if cas == "doublon":
+            return ("Deux écritures similaires détectées (même date & montant). "
+                    + ("Crédit 401 (probable facture) " if sens=="Crédit" else "Débit 401 (probable règlement/avoir) ")
+                    + "— confirmer s’il s’agit d’un doublon ou préciser l’explication.")
+    if compte.startswith("411"):
+        if cas == "non_letre":
+            return ("Client – poste non lettré ancien. "
+                    + ("(Débit 411 = facture client). " if sens=="Débit" else "(Crédit 411 = encaissement/avoir). ")
+                    + "Merci d’indiquer le statut de recouvrement et joindre la pièce si disponible.")
+        if cas == "sans_piece":
+            return "Client – pièce absente : merci de fournir la facture/avoir/relevé bancaire."
+        if cas == "doublon":
+            return ("Deux écritures similaires détectées (même date & montant). "
+                    + ("Débit 411 (probable facture) " if sens=="Débit" else "Crédit 411 (probable encaissement/avoir) ")
+                    + "— confirmer doublon ou expliquer.")
+    if compte.startswith("47"):
+        if cas in ("attente","sans_piece","non_letre"):
+            base = "Compte d’attente 47 — "
+            if sens == "Débit":
+                base += "mouvement au débit. "
+            elif sens == "Crédit":
+                base += "mouvement au crédit. "
+            return base + "Merci de préciser la nature réelle, le compte définitif et joindre le justificatif."
+    # fallback générique
+    if cas == "sans_piece":
+        return "Pièce absente : merci de fournir le justificatif."
+    if cas == "doublon":
+        return "Deux écritures similaires détectées : merci de confirmer s’il s’agit d’un doublon ou d’expliquer."
+    return "Merci de préciser la nature et fournir le justificatif."
 
 # ----------------- Génération des lignes tabulaires -----------------
 def generate_rows_tab(
@@ -96,7 +160,7 @@ def generate_rows_tab(
     cLet       = _getcol(df, "EcritureLet", "Lettrage", "CodeLettrage")
     cDateLet   = _getcol(df, "DateLet", "LettrageDate")
 
-    # diagnostic utile
+    # diagnostic
     with st.expander("🔎 Colonnes détectées"):
         st.write({
             "CompteNum": cCompteNum, "CompAuxNum": cCompAuxNum,
@@ -105,7 +169,7 @@ def generate_rows_tab(
             "EcritureLib": cLib, "EcritureLet": cLet, "DateLet": cDateLet
         })
 
-    # dates & montants
+    # dates
     if cEcrDate:
         df[cEcrDate] = _to_naive_datetime(df[cEcrDate])
         dt_i64 = df[cEcrDate].view("int64")
@@ -114,13 +178,13 @@ def generate_rows_tab(
         dt_i64 = None
         cutoff_i64 = None
 
-    amt = _amount_series(df, cDebit, cCredit)
+    # montants (absolu + signé)
+    amt_abs = _amount_series_abs(df, cDebit, cCredit)
+    amt_signed = _signed_amount_series(df, cDebit, cCredit)
 
     def sous_compte(row):
         aux = _fmt(row.get(cCompAuxNum, ""))
-        if aux: return aux
-        comp = _fmt(row.get(cCompteNum, ""))
-        return comp
+        return aux if aux else _fmt(row.get(cCompteNum, ""))
 
     rows: List[Dict[str, Any]] = []
 
@@ -136,18 +200,19 @@ def generate_rows_tab(
             m_old = dt_i64.notna() & (dt_i64 <= cutoff_i64)
         else:
             m_old = pd.Series(True, index=df.index)
-        m_amt = (amt >= float(amount_threshold))
+        m_amt = (amt_abs >= float(amount_threshold))
 
         cand = df[mask_tiers & m_unlet & m_old & m_amt].copy()
         for idx, r in cand.iterrows():
-            sc = sous_compte(r)
             comp = _fmt(r.get(cCompteNum, ""))
-            grp = _detect_group(comp)
-            d = r[cEcrDate].date().isoformat() if cEcrDate and pd.notna(r[cEcrDate]) else ""
-            lib = _fmt(r.get(cLib, ""))
-            piece = _fmt(r.get(cPieceRef, ""))
-            m = round(float(amt.loc[idx] or 0.0),2)
-            question = "Merci de préciser le statut (litige, relance, avoir, plan de règlement) et de joindre la pièce si disponible."
+            sens = _sens_from_signed(float(amt_signed.loc[idx]))
+            grp  = _detect_group(comp)
+            sc   = sous_compte(r)
+            d    = r[cEcrDate].date().isoformat() if cEcrDate and pd.notna(r[cEcrDate]) else ""
+            lib  = _fmt(r.get(cLib, ""))
+            piece= _fmt(r.get(cPieceRef, ""))
+            m    = round(float(amt_abs.loc[idx] or 0.0),2)
+            question = _question_text_for(comp, sens, cas="non_letre")
             rows.append({
                 "Sous-compte": sc, "Groupe": grp, "Date": d, "Libellé": lib,
                 "Montant": m, "Pièce": piece, "Question": question, "Statut": ""
@@ -158,79 +223,89 @@ def generate_rows_tab(
     if cCompteNum and cPieceRef:
         mask_tiers = _starts_with(df[cCompteNum], ("401","411"))
         m_nopic = _empty(df[cPieceRef])
-        m_amt = (amt >= float(amount_threshold))
+        m_amt = (amt_abs >= float(amount_threshold))
         miss = df[mask_tiers & m_nopic & m_amt].copy()
         for idx, r in miss.iterrows():
-            sc = sous_compte(r)
             comp = _fmt(r.get(cCompteNum, ""))
-            grp = _detect_group(comp)
-            d = r[cEcrDate].date().isoformat() if cEcrDate and pd.notna(r[cEcrDate]) else ""
-            lib = _fmt(r.get(cLib, ""))
-            m = round(float(amt.loc[idx] or 0.0),2)
-            question = "Pièce absente : pouvez-vous nous fournir la facture/l’avoir/le relevé correspondant ?"
+            sens = _sens_from_signed(float(amt_signed.loc[idx]))
+            grp  = _detect_group(comp)
+            sc   = sous_compte(r)
+            d    = r[cEcrDate].date().isoformat() if cEcrDate and pd.notna(r[cEcrDate]) else ""
+            lib  = _fmt(r.get(cLib, ""))
+            m    = round(float(amt_abs.loc[idx] or 0.0),2)
+            question = _question_text_for(comp, sens, cas="sans_piece")
             rows.append({
                 "Sous-compte": sc, "Groupe": grp, "Date": d, "Libellé": lib,
                 "Montant": m, "Pièce": "", "Question": question, "Statut": ""
             })
             if len(rows) >= max_rows: return pd.DataFrame(rows)
 
-    # 3) Doublons de règlements fournisseurs (401)
+    # 3) Doublons règlements fournisseurs (401)
     if cCompteNum and cEcrDate:
         tmp = df[_starts_with(df[cCompteNum], "401")].copy()
         if not tmp.empty:
             tmp[cEcrDate] = _to_naive_datetime(tmp[cEcrDate])
             tmp["__date__"] = tmp[cEcrDate].dt.date
-            tmp_amt = _amount_series(tmp, _getcol(tmp,"Debit"), _getcol(tmp,"Credit"))
-            tmp["__amt__"] = tmp_amt
+            s_signed = _signed_amount_series(tmp, _getcol(tmp,"Debit"), _getcol(tmp,"Credit"))
+            tmp["__amt_signed__"] = s_signed
+            tmp["__amt__"] = s_signed.abs()
             tmp = tmp[tmp["__amt__"] >= float(amount_threshold)]
             tcol = _getcol(tmp, "CompAuxNum") or cCompteNum
             if tcol in tmp.columns:
-                grp = tmp.groupby([tcol, "__date__", "__amt__"]).size().reset_index(name="n")
-                keys = grp[grp["n"] >= 2][[tcol, "__date__", "__amt__"]]
+                grp_idx = tmp.groupby([tcol, "__date__", "__amt__"]).size().reset_index(name="n")
+                keys = grp_idx[grp_idx["n"] >= 2][[tcol, "__date__", "__amt__"]]
                 if not keys.empty:
                     merged = tmp.merge(keys, on=[tcol, "__date__", "__amt__"], how="inner")
                     for _, r in merged.iterrows():
-                        sc = _fmt(r.get(tcol,""))
                         comp = _fmt(r.get(cCompteNum,""))
-                        d = r["__date__"].isoformat() if pd.notna(r["__date__"]) else ""
-                        lib = _fmt(r.get(cLib,""))
-                        m = round(float(r["__amt__"] or 0.0),2)
-                        question = "Deux écritures similaires détectées (même date & montant). Confirmez si doublon ou précisez l’explication (annulation/avoir)."
+                        sens = _sens_from_signed(float(r["__amt_signed__"]))
+                        sc   = _fmt(r.get(tcol,""))
+                        d    = r["__date__"].isoformat() if pd.notna(r["__date__"]) else ""
+                        lib  = _fmt(r.get(cLib,""))
+                        piece= _fmt(r.get(cPieceRef,""))
+                        m    = round(float(r["__amt__"] or 0.0),2)
+                        question = _question_text_for(comp, sens, cas="doublon")
                         rows.append({
                             "Sous-compte": sc, "Groupe": "Fournisseurs (401)", "Date": d, "Libellé": lib,
-                            "Montant": m, "Pièce": _fmt(r.get(cPieceRef,"")), "Question": question, "Statut": ""
+                            "Montant": m, "Pièce": piece, "Question": question, "Statut": ""
                         })
                         if len(rows) >= max_rows: return pd.DataFrame(rows)
 
-    # 4) Comptes d’attente 471 (toutes écritures)
+    # 4) Comptes d’attente 47* (toutes écritures 47…)
     if cCompteNum:
-        ca = df[_starts_with(df[cCompteNum], "471")].copy()
-        for _, r in ca.iterrows():
-            sc = _fmt(r.get(cCompAuxNum,"")) or _fmt(r.get(cCompteNum,""))
-            d = ""
-            if cEcrDate and pd.notna(r.get(cEcrDate,None)):
-                d = r[cEcrDate].date().isoformat()
-            lib = _fmt(r.get(cLib,""))
-            piece = _fmt(r.get(cPieceRef,""))
-            question = "Écriture en 471 : merci de préciser la nature réelle et le compte définitif, et de joindre le justificatif."
-            rows.append({
-                "Sous-compte": sc, "Groupe": "Comptes d'attente (471)", "Date": d, "Libellé": lib,
-                "Montant": "", "Pièce": piece, "Question": question, "Statut": ""
-            })
-            if len(rows) >= max_rows: return pd.DataFrame(rows)
+        ca = df[_starts_with(df[cCompteNum], "47")].copy()
+        if not ca.empty:
+            # pré-calcul du sens pour tout 47*
+            s_signed_ca = _signed_amount_series(ca, cDebit, cCredit)
+            for idx, r in ca.iterrows():
+                comp = _fmt(r.get(cCompteNum,""))
+                sens = _sens_from_signed(float(s_signed_ca.loc[idx] if idx in s_signed_ca.index else 0.0))
+                sc   = _fmt(r.get(cCompAuxNum,"")) or comp
+                d    = r[cEcrDate].date().isoformat() if cEcrDate and pd.notna(r.get(cEcrDate, None)) else ""
+                lib  = _fmt(r.get(cLib,""))
+                piece= _fmt(r.get(cPieceRef,""))
+                question = _question_text_for(comp, sens, cas="attente")
+                rows.append({
+                    "Sous-compte": sc, "Groupe": "Comptes d'attente (47)", "Date": d, "Libellé": lib,
+                    "Montant": "", "Pièce": piece, "Question": question, "Statut": ""
+                })
+                if len(rows) >= max_rows: return pd.DataFrame(rows)
 
     return pd.DataFrame(rows)
 
 def renumeroter(dfq: pd.DataFrame, par_sous_compte: bool) -> pd.DataFrame:
     dfq = dfq.copy()
+    if dfq.empty:
+        dfq["N°"] = []
+        return dfq
     if par_sous_compte:
+        dfq = dfq.sort_values(["Groupe","Sous-compte","Date","Libellé"], na_position="last")
         dfq["N°"] = (
-            dfq.sort_values(["Groupe","Sous-compte","Date","Libellé"])
-               .groupby(["Groupe","Sous-compte"])
+            dfq.groupby(["Groupe","Sous-compte"])
                .cumcount() + 1
         )
     else:
-        dfq = dfq.sort_values(["Groupe","Sous-compte","Date","Libellé"]).reset_index(drop=True)
+        dfq = dfq.sort_values(["Groupe","Sous-compte","Date","Libellé"], na_position="last").reset_index(drop=True)
         dfq["N°"] = dfq.index + 1
     return dfq
 
@@ -323,7 +398,7 @@ if not dfq.empty:
 
             # Appliquer modifications de ce sous-compte
             if st.button(f"Appliquer modifications — {grp} / {sc}", key=f"apply_{grp}_{sc}"):
-                # fusion : on remplace les lignes correspondantes par edited (hors Supprimer cochés)
+                # remplacer les lignes correspondantes par edited (hors Supprimer cochés)
                 keep_mask = ~((st.session_state["dfq"]["Groupe"] == grp) & (st.session_state["dfq"]["Sous-compte"] == sc))
                 remain = st.session_state["dfq"][keep_mask]
                 edited_clean = edited[edited["Supprimer"] != True].drop(columns=["Supprimer"], errors="ignore")
