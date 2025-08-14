@@ -2,7 +2,7 @@
 # ---------------------------------------------
 # Admin-only: importer un FEC, générer questions (401/411/471),
 # visualiser, modifier, supprimer, réordonner, exporter (Word/JSON).
-# Utilise st.query_params (pas d'API expérimentale).
+# Utilise st.query_params + dates "naïves" (pas de TZ).
 # ---------------------------------------------
 
 import os
@@ -17,7 +17,7 @@ from docx import Document
 # ---------- Dossiers ----------
 BASE_DIR = Path(__file__).parent
 FORMS_DIR = BASE_DIR / "forms"          # export JSON du formulaire
-EXPORTS_DIR = BASE_DIR / "exports"      # export Word/Excel éventuels
+EXPORTS_DIR = BASE_DIR / "exports"      # export Word
 FORMS_DIR.mkdir(exist_ok=True)
 EXPORTS_DIR.mkdir(exist_ok=True)
 
@@ -62,6 +62,13 @@ def _starts_with_series(s: pd.Series, prefixes):
 
 def _empty_series(s: pd.Series):
     return s.isna() | (s.astype(str).str.strip() == "")
+
+def _to_naive_datetime(series: pd.Series) -> pd.Series:
+    """
+    Convertit en datetime tz-naïf (UTC->naïf) pour éviter les comparaisons tz-aware vs naïf.
+    """
+    s = pd.to_datetime(series, errors="coerce", utc=True)   # tz-aware UTC
+    return s.dt.tz_localize(None)                           # retire le tz -> naïf
 
 def _make_amount_series(df: pd.DataFrame, cDebit: str, cCredit: str):
     def to_num(x):
@@ -125,8 +132,8 @@ def generate_questions_401_411_471(
     # dates & montants
     cutoff = None
     if cEcrDate:
-        df[cEcrDate] = pd.to_datetime(df[cEcrDate], errors="coerce")
-        cutoff = pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=aging_days)
+        df[cEcrDate] = _to_naive_datetime(df[cEcrDate])              # ✅ tz-aware -> naïf
+        cutoff = pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=aging_days)  # ✅ naïf
 
     amt_series = _make_amount_series(df, cDebit, cCredit)
 
@@ -209,10 +216,10 @@ def generate_questions_401_411_471(
     # 3) Doublons de règlements fournisseurs (même date + même montant + même tiers)
     cEcrDate_ok = cEcrDate and (cEcrDate in df.columns)
     if cCompteNum and cEcrDate_ok:
-        mask_401 = _starts_with_series(df[cCompteNum], "401")
-        tmp = df[mask_401].copy()
+        # Reconvertir proprement la sous-série pour éviter TZ
+        tmp = df[_starts_with_series(df[cCompteNum], "401")].copy()
         if not tmp.empty:
-            tmp[cEcrDate] = pd.to_datetime(tmp[cEcrDate], errors="coerce")
+            tmp[cEcrDate] = _to_naive_datetime(tmp[cEcrDate])      # ✅
             amounts = _make_amount_series(tmp, cDebit, cCredit)
             tmp["__amt__"] = amounts
             tmp["__date__"] = tmp[cEcrDate].dt.date
@@ -251,14 +258,15 @@ st.set_page_config(page_title="Préparation formulaire (Admin)", page_icon="🧾
 st.title("👩‍💼 Préparation du formulaire (comptable)")
 st.caption("Importer un FEC, générer les questions (401/411/471), modifier/supprimer/réordonner, puis exporter le formulaire.")
 
-# Paramètres (query params modernes)
-qp = st.query_params  # dict-like
+# Query params modernes
+qp = st.query_params
 form_title = st.text_input("Titre du formulaire (pour l'export)", value=qp.get("title", "Formulaire client"))
 
-# Zone d'import du FEC (claire et visible)
+# 1) Upload FEC
 st.subheader("1) Importer un FEC")
 fec_file = st.file_uploader("Fichier FEC (CSV / TXT / Excel)", type=["csv", "txt", "xlsx", "xls"])
 
+# 2) Paramètres d'analyse
 st.subheader("2) Paramètres d'analyse (401/411/471)")
 colA, colB, colC = st.columns(3)
 with colA:
@@ -270,7 +278,6 @@ with colC:
 
 st.divider()
 
-# Mémoire locale des questions en cours d'édition
 if "questions" not in st.session_state:
     st.session_state["questions"] = []
 
@@ -291,7 +298,7 @@ with col_gen1:
                 if not qs:
                     st.info("Aucune question pertinente détectée (selon vos paramètres).")
                 else:
-                    st.session_state["questions"] = qs  # remplace la liste
+                    st.session_state["questions"] = qs
                     st.success(f"{len(qs)} question(s) générée(s). Vous pouvez maintenant modifier/supprimer/réordonner.")
             except Exception as e:
                 st.error(f"Erreur d'analyse du FEC: {e}")
@@ -300,10 +307,10 @@ with col_gen2:
     if st.button("Vider la liste"):
         st.session_state["questions"] = []
 
+# 3) Édition du formulaire
 st.subheader("3) Édition du formulaire (modifier / supprimer / réordonner)")
 qs = st.session_state["questions"]
 
-# Ajout manuel d'une question
 with st.expander("➕ Ajouter une question manuellement"):
     c1, c2 = st.columns([2,1])
     with c1:
@@ -324,7 +331,6 @@ with st.expander("➕ Ajouter une question manuellement"):
         else:
             st.warning("Le texte de la question est vide.")
 
-# Liste éditable
 to_delete = []
 reordered = []
 for i, q in enumerate(qs):
@@ -340,7 +346,6 @@ for i, q in enumerate(qs):
         if st.button("🗑️", key=f"del_{i}", help="Supprimer cette question"):
             to_delete.append(i)
 
-    # Options si checkbox_multi
     if q["type"] == "checkbox_multi":
         opt_str = "; ".join(q.get("options", []))
         new_opt_str = st.text_input("Options (; séparées)", value=opt_str, key=f"opts_{i}")
@@ -348,20 +353,19 @@ for i, q in enumerate(qs):
 
     reordered.append((pos, q))
 
-# Suppressions
 if to_delete:
     for idx in sorted(to_delete, reverse=True):
         qs.pop(idx)
     st.session_state["questions"] = qs
     st.rerun()
 
-# Réordonner
 if st.button("Appliquer l'ordre"):
     reordered.sort(key=lambda x: x[0])
     qs = [q for _, q in reordered]
     st.session_state["questions"] = qs
     st.success("Ordre mis à jour.")
 
+# 4) Export
 st.subheader("4) Exporter le formulaire")
 col_e1, col_e2 = st.columns(2)
 with col_e1:
