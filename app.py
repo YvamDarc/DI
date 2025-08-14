@@ -1,8 +1,8 @@
 # app_admin.py — Admin only (FEC -> questions tabulaires par sous-compte)
-# Colonnes: N°, Date, Libellé, Question, Montant, Pièce, Statut, Sous-compte, Groupe
+# Colonnes: N°, Date, Libellé, Question, Montant, Pièce, Sous-compte, Groupe
 # Comptes: 401 (fournisseurs), 411 (clients), 47* (comptes d'attente)
 # Texte adapté selon sens Débit/Crédit pour chaque catégorie
-# Édition via st.data_editor, suppression, renumérotation, export JSON/Excel
+# Édition via st.data_editor, suppression, renumérotation, export Word + JSON client
 # st.query_params + parsing dates robuste
 
 import os
@@ -12,9 +12,7 @@ from typing import List, Dict, Any, Optional
 
 import streamlit as st
 import pandas as pd
-
 from docx import Document
-from docx.shared import Pt
 
 # ----------------- Dossiers -----------------
 BASE_DIR = Path(__file__).parent
@@ -52,8 +50,7 @@ def _amount_series_abs(df: pd.DataFrame, cDebit: Optional[str], cCredit: Optiona
             s = s.str.replace(",", ".", regex=False)
         return pd.to_numeric(s, errors="coerce").fillna(0.0)
     if cDebit and cDebit in df.columns and cCredit and cCredit in df.columns:
-        d = to_num(df[cDebit])
-        c = to_num(df[cCredit])
+        d = to_num(df[cDebit]); c = to_num(df[cCredit])
         return (d - c).abs()
     elif cDebit and cDebit in df.columns:
         return to_num(df[cDebit]).abs()
@@ -218,7 +215,7 @@ def generate_rows_tab(
             question = _question_text_for(comp, sens, cas="non_letre")
             rows.append({
                 "Sous-compte": sc, "Groupe": grp, "Date": d, "Libellé": lib,
-                "Montant": m, "Pièce": piece, "Question": question, "Statut": ""
+                "Montant": m, "Pièce": piece, "Question": question
             })
             if len(rows) >= max_rows: return pd.DataFrame(rows)
 
@@ -239,7 +236,7 @@ def generate_rows_tab(
             question = _question_text_for(comp, sens, cas="sans_piece")
             rows.append({
                 "Sous-compte": sc, "Groupe": grp, "Date": d, "Libellé": lib,
-                "Montant": m, "Pièce": "", "Question": question, "Statut": ""
+                "Montant": m, "Pièce": "", "Question": question
             })
             if len(rows) >= max_rows: return pd.DataFrame(rows)
 
@@ -270,7 +267,7 @@ def generate_rows_tab(
                         question = _question_text_for(comp, sens, cas="doublon")
                         rows.append({
                             "Sous-compte": sc, "Groupe": "Fournisseurs (401)", "Date": d, "Libellé": lib,
-                            "Montant": m, "Pièce": piece, "Question": question, "Statut": ""
+                            "Montant": m, "Pièce": piece, "Question": question
                         })
                         if len(rows) >= max_rows: return pd.DataFrame(rows)
 
@@ -290,7 +287,7 @@ def generate_rows_tab(
                 question = _question_text_for(comp, sens, cas="attente")
                 rows.append({
                     "Sous-compte": sc, "Groupe": "Comptes d'attente (47)", "Date": d, "Libellé": lib,
-                    "Montant": "", "Pièce": piece, "Question": question, "Statut": ""
+                    "Montant": "", "Pièce": piece, "Question": question
                 })
                 if len(rows) >= max_rows: return pd.DataFrame(rows)
 
@@ -312,7 +309,8 @@ def renumeroter(dfq: pd.DataFrame, par_sous_compte: bool) -> pd.DataFrame:
         dfq["N°"] = dfq.index + 1
     return dfq
 
-def export_word(dfq: pd.DataFrame, titre_formulaire: str):
+# ----------------- Export Word & JSON client -----------------
+def export_word(dfq: pd.DataFrame, titre_formulaire: str) -> Path:
     """Exporte le tableau des questions vers un document Word clair et synthétique."""
     doc = Document()
     doc.add_heading(f"Demande d'informations – {titre_formulaire}", 0)
@@ -321,21 +319,36 @@ def export_word(dfq: pd.DataFrame, titre_formulaire: str):
     for (grp, sc), df_sub in dfq.groupby(["Groupe", "Sous-compte"], sort=False):
         doc.add_heading(f"{grp} – Sous-compte {sc}", level=1)
         for _, row in df_sub.iterrows():
-            date_str = row["Date"] if pd.notna(row["Date"]) else "(date inconnue)"
+            date_str = row["Date"] if (isinstance(row["Date"], str) and row["Date"]) else "(date inconnue)"
             lib = row["Libellé"]
-            montant = f"{row['Montant']:.2f} €" if row["Montant"] not in ("", None) else ""
+            # Montant formaté si présent
+            if row["Montant"] not in ("", None) and str(row["Montant"]).strip() != "":
+                try:
+                    montant = f"{float(row['Montant']):,.2f} €".replace(",", " ").replace(".", ",")
+                except Exception:
+                    montant = str(row["Montant"])
+            else:
+                montant = ""
             piece = row["Pièce"] if row["Pièce"] else "(pièce absente)"
             question = row["Question"]
 
             p = doc.add_paragraph()
-            p.add_run(f"Écriture du {date_str} — {lib} — montant : {montant} — pièce : {piece}\n").bold = True
+            bold = p.add_run(f"Écriture du {date_str} — {lib}")
+            bold.bold = True
+            details = []
+            if montant:
+                details.append(f"montant : {montant}")
+            if piece:
+                details.append(f"pièce : {piece}")
+            if details:
+                doc.add_paragraph(" ; ".join(details))
             doc.add_paragraph(question)
 
     out_path = EXPORTS_DIR / f"{titre_formulaire.replace(' ','_')}.docx"
     doc.save(out_path)
     return out_path
 
-def export_json_for_client(dfq: pd.DataFrame, client_id: str):
+def export_json_for_client(dfq: pd.DataFrame, client_id: str) -> Path:
     """Exporte un JSON structuré pour utilisation dans l'appli client."""
     data = {
         "client_id": client_id,
@@ -343,7 +356,7 @@ def export_json_for_client(dfq: pd.DataFrame, client_id: str):
     }
     for _, row in dfq.iterrows():
         data["questions"].append({
-            "numero": row.get("N°", ""),
+            "numero": int(row["N°"]) if str(row.get("N°","")).strip() != "" else None,
             "date": row.get("Date", ""),
             "libelle": row.get("Libellé", ""),
             "montant": row.get("Montant", ""),
@@ -351,7 +364,7 @@ def export_json_for_client(dfq: pd.DataFrame, client_id: str):
             "question": row.get("Question", ""),
             "sous_compte": row.get("Sous-compte", ""),
             "groupe": row.get("Groupe", ""),
-            "type": "mixte"  # mixte = réponse texte + upload fichier
+            "type": "mixte"  # mixte = réponse texte + upload fichier côté client
         })
     out_path = EXPORTS_DIR / f"{client_id}_questions.json"
     with open(out_path, "w", encoding="utf-8") as f:
@@ -359,27 +372,12 @@ def export_json_for_client(dfq: pd.DataFrame, client_id: str):
     return out_path
 
 # ----------------- UI -----------------
-colz1, colz2 = st.columns(2)
-with colz1:
-    if st.button("📄 Exporter en Word"):
-        if not dfq.empty:
-            path_word = export_word(dfq, titre)
-            with open(path_word, "rb") as fh:
-                st.download_button("Télécharger le Word", fh, file_name=path_word.name)
-with colz2:
-    client_id_export = st.text_input("Identifiant client pour export JSON", value="client_demo")
-    if st.button("💾 Export JSON pour client"):
-        if not dfq.empty:
-            path_json = export_json_for_client(dfq, client_id_export)
-            with open(path_json, "rb") as fh:
-                st.download_button("Télécharger JSON client", fh, file_name=path_json.name)
-
 st.set_page_config(page_title="Préparation formulaire (Admin)", page_icon="🧾", layout="wide")
 st.title("👩‍💼 Préparation du formulaire (comptable)")
-st.caption("Importer un FEC → Générer des questions → Modifier/Supprimer → Organiser par sous-compte → Export JSON/Excel")
+st.caption("Importer un FEC → Générer des questions → Modifier/Supprimer → Organiser par sous-compte → Export Word / JSON client")
 
 qp = st.query_params
-titre = st.text_input("Titre du formulaire (pour l'export)", value=qp.get("title", "Formulaire client"))
+titre = st.text_input("Titre du formulaire (pour l'export Word)", value=qp.get("title", "Formulaire client"))
 
 st.subheader("1) Importer un FEC")
 fec_file = st.file_uploader("Fichier FEC (CSV / TXT / Excel)", type=["csv","txt","xlsx","xls"])
@@ -414,7 +412,7 @@ with b1:
                 else:
                     dfq = renumeroter(dfq, par_sous_compte=renum_par_sc)
                     # ordre colonnes
-                    cols = ["N°","Date","Libellé","Question","Montant","Pièce","Statut","Sous-compte","Groupe"]
+                    cols = ["N°","Date","Libellé","Question","Montant","Pièce","Sous-compte","Groupe"]
                     for c in cols:
                         if c not in dfq.columns: dfq[c] = ""
                     st.session_state["dfq"] = dfq[cols]
@@ -451,7 +449,6 @@ if not dfq.empty:
                     "Question": st.column_config.TextColumn("Question"),
                     "Montant": st.column_config.NumberColumn("Montant", step=0.01),
                     "Pièce": st.column_config.TextColumn("Pièce"),
-                    "Statut": st.column_config.TextColumn("Statut", help="litige / relance / avoir / plan de règlement / ..."),
                     "Sous-compte": st.column_config.TextColumn("Sous-compte", width="small"),
                     "Groupe": st.column_config.TextColumn("Groupe", width="small"),
                     "Supprimer": st.column_config.CheckboxColumn("🗑️", help="Cocher pour supprimer"),
@@ -477,23 +474,17 @@ if not dfq.empty:
         st.success("Renumérotation effectuée.")
 
     st.subheader("4) Export")
-    colx, coly = st.columns(2)
-    with colx:
-        if st.button("Exporter en JSON"):
-            out = EXPORTS_DIR / f"{titre.replace(' ','_')}.json"
-            st.session_state["dfq"].to_json(out, orient="records", force_ascii=False, indent=2)
-            with open(out, "rb") as fh:
-                st.download_button("Télécharger le JSON", fh, file_name=out.name)
-    with coly:
-        if st.button("Exporter en Excel"):
-            out = EXPORTS_DIR / f"{titre.replace(' ','_')}.xlsx"
-            with pd.ExcelWriter(out, engine="openpyxl") as writer:
-                # Feuille par groupe pour lisibilité
-                for grp, df_grp in st.session_state["dfq"].groupby("Groupe"):
-                    df_grp.to_excel(writer, sheet_name=grp[:31], index=False)
-                # Feuille 'Tout'
-                st.session_state["dfq"].to_excel(writer, sheet_name="Tout", index=False)
-            with open(out, "rb") as fh:
-                st.download_button("Télécharger l'Excel", fh, file_name=out.name)
+    colW, colJ = st.columns(2)
+    with colW:
+        if st.button("📄 Exporter en Word"):
+            out_word = export_word(st.session_state["dfq"], titre)
+            with open(out_word, "rb") as fh:
+                st.download_button("Télécharger le Word", fh, file_name=out_word.name)
+    with colJ:
+        client_id_export = st.text_input("Identifiant client pour le JSON", value="client_demo")
+        if st.button("💾 Export JSON pour l'appli client"):
+            out_json = export_json_for_client(st.session_state["dfq"], client_id_export)
+            with open(out_json, "rb") as fh:
+                st.download_button("Télécharger le JSON client", fh, file_name=out_json.name)
 else:
     st.info("Aucune ligne à afficher. Importez un FEC et cliquez sur « Analyser le FEC et générer ».") 
