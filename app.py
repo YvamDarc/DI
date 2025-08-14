@@ -1,34 +1,31 @@
-# app_admin.py
-# ---------------------------------------------
-# Admin-only: importer un FEC, générer questions (401/411/471),
-# visualiser, modifier, supprimer, réordonner, exporter (Word/JSON).
-# Utilise st.query_params + dates "naïves" (pas de TZ).
-# ---------------------------------------------
+# app_admin.py — Admin only (FEC -> questions -> éditer -> exporter)
+# Corrigé : dates homogénéisées (naïves) + comparaison int64
+# UI : upload FEC, génération (401/411/471), édition, suppression, ordre, export JSON/Word
+# Query params : st.query_params
 
 import os
 import json
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import streamlit as st
 import pandas as pd
 from docx import Document
 
-# ---------- Dossiers ----------
+# ----------------- Dossiers -----------------
 BASE_DIR = Path(__file__).parent
-FORMS_DIR = BASE_DIR / "forms"          # export JSON du formulaire
-EXPORTS_DIR = BASE_DIR / "exports"      # export Word
+FORMS_DIR = BASE_DIR / "forms"     # export JSON
+EXPORTS_DIR = BASE_DIR / "exports" # export Word
 FORMS_DIR.mkdir(exist_ok=True)
 EXPORTS_DIR.mkdir(exist_ok=True)
 
 SUPPORTED_TYPES = ["oui_non", "texte", "checkbox_multi", "fichier"]
 
-# ---------- Utilitaires ----------
+# ----------------- Utils génériques -----------------
 def normalize_options(opt_str: str) -> List[str]:
     if not isinstance(opt_str, str):
         return []
-    parts = [o.strip() for o in str(opt_str).split(";")]
-    return [p for p in parts if p]
+    return [p.strip() for p in opt_str.split(";") if p.strip()]
 
 def export_word(questions: List[Dict[str, Any]], title: str) -> Path:
     doc = Document()
@@ -44,11 +41,11 @@ def save_form_json(questions: List[Dict[str, Any]], filename: str) -> Path:
     out.write_text(json.dumps(questions, ensure_ascii=False, indent=2), encoding="utf-8")
     return out
 
-# ---------- FEC helpers ----------
+# ----------------- FEC helpers -----------------
 def _colmap(df: pd.DataFrame) -> dict:
     return {c.lower(): c for c in df.columns}
 
-def _getcol(df: pd.DataFrame, *candidates: str):
+def _getcol(df: pd.DataFrame, *candidates: str) -> Optional[str]:
     cmap = _colmap(df)
     for cand in candidates:
         if cand.lower() in cmap:
@@ -64,24 +61,34 @@ def _empty_series(s: pd.Series):
     return s.isna() | (s.astype(str).str.strip() == "")
 
 def _to_naive_datetime(series: pd.Series) -> pd.Series:
-    """
-    Convertit en datetime tz-naïf (UTC->naïf) pour éviter les comparaisons tz-aware vs naïf.
-    """
-    s = pd.to_datetime(series, errors="coerce", utc=True)   # tz-aware UTC
-    return s.dt.tz_localize(None)                           # retire le tz -> naïf
+    """Parse -> UTC aware -> drop tz -> naïf."""
+    s = pd.to_datetime(series, errors="coerce", utc=True)   # tz-aware
+    return s.dt.tz_localize(None)                           # drop tz => naïf
 
-def _make_amount_series(df: pd.DataFrame, cDebit: str, cCredit: str):
-    def to_num(x):
-        if isinstance(x, str):
-            x = x.replace(",", ".")
-        return pd.to_numeric(x, errors="coerce")
-    if cDebit and (cDebit in df.columns) and cCredit and (cCredit in df.columns):
+def _to_i64(series_dt_naive: pd.Series) -> pd.Series:
+    """Convertit une série datetime64[ns] (naïve) en int64 (ns since epoch).
+    NaT -> très petit int64 -> on gérera avec notna() à part.
+    """
+    return series_dt_naive.view("int64")
+
+def _cutoff_i64(days: int) -> int:
+    """Cutoff à J-<days>, au début de journée UTC, en int64 ns."""
+    # Timestamp naïf (pas de tz) puis vue int64
+    cutoff = (pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=days))
+    return cutoff.value  # int64 ns
+
+def _make_amount_series(df: pd.DataFrame, cDebit: Optional[str], cCredit: Optional[str]) -> pd.Series:
+    def to_num(s):
+        if s.dtype == object:
+            s = s.str.replace(",", ".", regex=False)
+        return pd.to_numeric(s, errors="coerce")
+    if cDebit and cDebit in df.columns and cCredit and cCredit in df.columns:
         d = to_num(df[cDebit]).fillna(0.0)
         c = to_num(df[cCredit]).fillna(0.0)
         return (d - c).abs()
-    elif cDebit and (cDebit in df.columns):
+    elif cDebit and cDebit in df.columns:
         return to_num(df[cDebit]).abs().fillna(0.0)
-    elif cCredit and (cCredit in df.columns):
+    elif cCredit and cCredit in df.columns:
         return to_num(df[cCredit]).abs().fillna(0.0)
     else:
         return pd.Series(0.0, index=df.index)
@@ -89,17 +96,15 @@ def _make_amount_series(df: pd.DataFrame, cDebit: str, cCredit: str):
 def read_fec_autodetect(uploaded_file) -> pd.DataFrame:
     # 1) CSV auto-sep
     try:
-        df = pd.read_csv(uploaded_file, sep=None, engine="python", dtype=str)
-        return df
+        return pd.read_csv(uploaded_file, sep=None, engine="python", dtype=str)
     except Exception:
         try:
             uploaded_file.seek(0)
         except Exception:
             pass
-    # 2) CSV ; separé
+    # 2) CSV ;
     try:
-        df = pd.read_csv(uploaded_file, sep=";", dtype=str)
-        return df
+        return pd.read_csv(uploaded_file, sep=";", dtype=str)
     except Exception:
         try:
             uploaded_file.seek(0)
@@ -129,11 +134,27 @@ def generate_questions_401_411_471(
     cDateLet   = _getcol(df, "DateLet", "LettrageDate")
     cLib       = _getcol(df, "EcritureLib", "LibelleEcriture")
 
-    # dates & montants
-    cutoff = None
+    # --- DIAGNOSTIC rapide ---
+    with st.expander("🔎 Diagnostic colonnes détectées"):
+        st.write({
+            "CompteNum": cCompteNum, "CompteLib": cCompteLib,
+            "CompAuxNum": cCompAuxNum, "CompAuxLib": cCompAuxLib,
+            "EcritureDate": cEcrDate, "PieceRef": cPieceRef,
+            "Debit": cDebit, "Credit": cCredit,
+            "EcritureLet": cLet, "DateLet": cDateLet,
+            "EcritureLib": cLib
+        })
+
+    # Dates & montants
     if cEcrDate:
-        df[cEcrDate] = _to_naive_datetime(df[cEcrDate])              # ✅ tz-aware -> naïf
-        cutoff = pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=aging_days)  # ✅ naïf
+        # Série datetime naïve + int64
+        dt_naive = _to_naive_datetime(df[cEcrDate])
+        df[cEcrDate] = dt_naive                          # garde la version datetime naïve
+        dt_i64 = _to_i64(dt_naive)                       # version int64 pour comparaisons
+        cutoff_i64 = _cutoff_i64(aging_days)
+    else:
+        dt_i64 = None
+        cutoff_i64 = None
 
     amt_series = _make_amount_series(df, cDebit, cCredit)
 
@@ -155,13 +176,14 @@ def generate_questions_401_411_471(
                 m_unlet = m_unlet | df[cDateLet].isna()
         else:
             m_unlet = pd.Series(True, index=df.index)
-        if cEcrDate:
-            m_old = df[cEcrDate].notna() & (df[cEcrDate] <= cutoff)
+        # ancienneté via int64 (robuste)
+        if cEcrDate and dt_i64 is not None:
+            m_date_ok = dt_i64.notna() & (dt_i64 <= cutoff_i64)
         else:
-            m_old = pd.Series(True, index=df.index)
+            m_date_ok = pd.Series(True, index=df.index)
         m_amt = (amt_series >= float(amount_threshold))
 
-        cand = df[mask_tiers & m_unlet & m_old & m_amt].copy()
+        cand = df[mask_tiers & m_unlet & m_date_ok & m_amt].copy()
         rows = []
         for idx, r in cand.iterrows():
             t_id, t_lib = tier_id(r)
@@ -213,18 +235,17 @@ def generate_questions_401_411_471(
                 q.append({"type":"texte","question":f"{n} écriture(s) sur {t} {('('+lib+')' if lib else '')} sans référence de pièce. Précisez la référence (ou raison)."})
                 q.append({"type":"fichier","question":f"Joindre les pièces manquantes pour {t} {('('+lib+')' if lib else '')}."})
 
-    # 3) Doublons de règlements fournisseurs (même date + même montant + même tiers)
-    cEcrDate_ok = cEcrDate and (cEcrDate in df.columns)
-    if cCompteNum and cEcrDate_ok:
-        # Reconvertir proprement la sous-série pour éviter TZ
+    # 3) Doublons de règlements fournisseurs
+    if cCompteNum and cEcrDate:
         tmp = df[_starts_with_series(df[cCompteNum], "401")].copy()
         if not tmp.empty:
-            tmp[cEcrDate] = _to_naive_datetime(tmp[cEcrDate])      # ✅
-            amounts = _make_amount_series(tmp, cDebit, cCredit)
+            tmp_dt_naive = _to_naive_datetime(tmp[cEcrDate])
+            tmp_dt_i64 = _to_i64(tmp_dt_naive)
+            tmp["__date__"] = pd.to_datetime(tmp_dt_naive, errors="coerce").dt.date
+            amounts = _make_amount_series(tmp, _getcol(tmp, "Debit"), _getcol(tmp, "Credit"))
             tmp["__amt__"] = amounts
-            tmp["__date__"] = tmp[cEcrDate].dt.date
             tmp = tmp[tmp["__amt__"] >= float(amount_threshold)]
-            tcol = cCompAuxNum or cCompteNum
+            tcol = _getcol(tmp, "CompAuxNum") or cCompteNum
             if tcol in tmp.columns:
                 grp = tmp.groupby([tcol, "__date__", "__amt__"]).size().reset_index(name="n")
                 dup = grp[grp["n"] >= 2].head(top_n_per_bucket)
@@ -237,9 +258,9 @@ def generate_questions_401_411_471(
 
     # 4) Comptes d'attente 471
     if cCompteNum:
-        mask_471 = _starts_with_series(df[cCompteNum], "471")
-        ca = df[mask_471].copy()
+        ca = df[_starts_with_series(df[cCompteNum], "471")].copy()
         if len(ca):
+            cLib = _getcol(ca, "EcritureLib", "LibelleEcriture")
             if cLib and (cLib in ca.columns):
                 grp = ca.groupby(cLib).size().reset_index(name="n").sort_values("n", ascending=False).head(top_n_per_bucket)
                 for _, r in grp.iterrows():
@@ -252,21 +273,17 @@ def generate_questions_401_411_471(
 
     return q
 
-# ---------- UI ADMIN-ONLY ----------
+# ----------------- UI ADMIN -----------------
 st.set_page_config(page_title="Préparation formulaire (Admin)", page_icon="🧾", layout="centered")
-
 st.title("👩‍💼 Préparation du formulaire (comptable)")
-st.caption("Importer un FEC, générer les questions (401/411/471), modifier/supprimer/réordonner, puis exporter le formulaire.")
+st.caption("Importer un FEC, générer des questions (401/411/471), modifier/supprimer/réordonner, puis exporter le formulaire.")
 
-# Query params modernes
 qp = st.query_params
 form_title = st.text_input("Titre du formulaire (pour l'export)", value=qp.get("title", "Formulaire client"))
 
-# 1) Upload FEC
 st.subheader("1) Importer un FEC")
 fec_file = st.file_uploader("Fichier FEC (CSV / TXT / Excel)", type=["csv", "txt", "xlsx", "xls"])
 
-# 2) Paramètres d'analyse
 st.subheader("2) Paramètres d'analyse (401/411/471)")
 colA, colB, colC = st.columns(3)
 with colA:
@@ -281,8 +298,8 @@ st.divider()
 if "questions" not in st.session_state:
     st.session_state["questions"] = []
 
-col_gen1, col_gen2 = st.columns([1,1])
-with col_gen1:
+c1, c2 = st.columns([1,1])
+with c1:
     if st.button("Analyser le FEC et générer des questions"):
         if fec_file is None:
             st.warning("Veuillez importer un FEC.")
@@ -302,28 +319,22 @@ with col_gen1:
                     st.success(f"{len(qs)} question(s) générée(s). Vous pouvez maintenant modifier/supprimer/réordonner.")
             except Exception as e:
                 st.error(f"Erreur d'analyse du FEC: {e}")
-
-with col_gen2:
+with c2:
     if st.button("Vider la liste"):
         st.session_state["questions"] = []
 
-# 3) Édition du formulaire
 st.subheader("3) Édition du formulaire (modifier / supprimer / réordonner)")
 qs = st.session_state["questions"]
 
 with st.expander("➕ Ajouter une question manuellement"):
-    c1, c2 = st.columns([2,1])
-    with c1:
+    a1, a2 = st.columns([2,1])
+    with a1:
         new_label = st.text_input("Texte de la question", key="new_label_admin")
-    with c2:
+    with a2:
         new_type = st.selectbox("Type", SUPPORTED_TYPES, key="new_type_admin")
     new_opts_str = st.text_input("Options (séparées par ';') pour checkbox_multi", key="new_opts_admin")
     if st.button("Ajouter la question manuelle"):
-        q = {
-            "type": new_type,
-            "question": new_label.strip() if new_label else "",
-            "options": normalize_options(new_opts_str)
-        }
+        q = {"type": new_type, "question": new_label.strip() if new_label else "", "options": normalize_options(new_opts_str)}
         if q["question"]:
             qs.append(q)
             st.session_state["questions"] = qs
@@ -335,14 +346,14 @@ to_delete = []
 reordered = []
 for i, q in enumerate(qs):
     st.markdown(f"**Q{i+1}**")
-    c1, c2, c3, c4 = st.columns([4,2,1,1])
-    with c1:
+    b1, b2, b3, b4 = st.columns([4,2,1,1])
+    with b1:
         q["question"] = st.text_input("Intitulé", value=q["question"], key=f"label_{i}")
-    with c2:
+    with b2:
         q["type"] = st.selectbox("Type", SUPPORTED_TYPES, index=SUPPORTED_TYPES.index(q["type"]), key=f"type_{i}")
-    with c3:
+    with b3:
         pos = st.number_input("Ordre", min_value=1, max_value=len(qs), value=i+1, key=f"pos_{i}")
-    with c4:
+    with b4:
         if st.button("🗑️", key=f"del_{i}", help="Supprimer cette question"):
             to_delete.append(i)
 
@@ -365,19 +376,18 @@ if st.button("Appliquer l'ordre"):
     st.session_state["questions"] = qs
     st.success("Ordre mis à jour.")
 
-# 4) Export
 st.subheader("4) Exporter le formulaire")
-col_e1, col_e2 = st.columns(2)
-with col_e1:
+e1, e2 = st.columns(2)
+with e1:
     if st.button("Exporter en JSON"):
-        p = save_form_json(st.session_state["questions"], filename=form_title)
+        p = save_form_json(st.session_state["questions"], filename=qp.get("title", "Formulaire client"))
         with open(p, "rb") as fh:
             st.download_button("Télécharger le JSON", fh, file_name=p.name)
-with col_e2:
+with e2:
     if st.button("Exporter en Word"):
         if not st.session_state["questions"]:
             st.warning("Pas de questions à exporter.")
         else:
-            p = export_word(st.session_state["questions"], title=form_title)
+            p = export_word(st.session_state["questions"], title=qp.get("title", "Formulaire client"))
             with open(p, "rb") as fh:
                 st.download_button("Télécharger le .docx", fh, file_name=p.name)
