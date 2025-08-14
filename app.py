@@ -1,7 +1,7 @@
-# app_admin.py — Admin only (FEC -> questions -> éditer -> exporter)
-# Corrigé : dates homogénéisées (naïves) + comparaison int64
-# UI : upload FEC, génération (401/411/471), édition, suppression, ordre, export JSON/Word
-# Query params : st.query_params
+# app_admin.py — Admin only
+# FEC -> Génération de questions "par écriture" (401/411/471)
+# Edition (modifier/supprimer/ordre) + Export JSON/Word
+# st.query_params + dates homogénéisées, comparaisons robustes
 
 import os
 import json
@@ -25,7 +25,7 @@ SUPPORTED_TYPES = ["oui_non", "texte", "checkbox_multi", "fichier"]
 def normalize_options(opt_str: str) -> List[str]:
     if not isinstance(opt_str, str):
         return []
-    return [p.strip() for p in opt_str.split(";") if p.strip()]
+    return [p.strip() for p in str(opt_str).split(";") if p.strip()]
 
 def export_word(questions: List[Dict[str, Any]], title: str) -> Path:
     doc = Document()
@@ -66,16 +66,12 @@ def _to_naive_datetime(series: pd.Series) -> pd.Series:
     return s.dt.tz_localize(None)                           # drop tz => naïf
 
 def _to_i64(series_dt_naive: pd.Series) -> pd.Series:
-    """Convertit une série datetime64[ns] (naïve) en int64 (ns since epoch).
-    NaT -> très petit int64 -> on gérera avec notna() à part.
-    """
+    """datetime64[ns] -> int64 (ns since epoch)."""
     return series_dt_naive.view("int64")
 
 def _cutoff_i64(days: int) -> int:
-    """Cutoff à J-<days>, au début de journée UTC, en int64 ns."""
-    # Timestamp naïf (pas de tz) puis vue int64
-    cutoff = (pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=days))
-    return cutoff.value  # int64 ns
+    """Cutoff à J-<days>, début de journée UTC, en int64 ns."""
+    return (pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=days)).value
 
 def _make_amount_series(df: pd.DataFrame, cDebit: Optional[str], cCredit: Optional[str]) -> pd.Series:
     def to_num(s):
@@ -98,26 +94,47 @@ def read_fec_autodetect(uploaded_file) -> pd.DataFrame:
     try:
         return pd.read_csv(uploaded_file, sep=None, engine="python", dtype=str)
     except Exception:
-        try:
-            uploaded_file.seek(0)
-        except Exception:
-            pass
+        try: uploaded_file.seek(0)
+        except Exception: pass
     # 2) CSV ;
     try:
         return pd.read_csv(uploaded_file, sep=";", dtype=str)
     except Exception:
-        try:
-            uploaded_file.seek(0)
-        except Exception:
-            pass
+        try: uploaded_file.seek(0)
+        except Exception: pass
     # 3) Excel
     return pd.read_excel(uploaded_file)
 
-def generate_questions_401_411_471(
+# ----------------- Génération "par écriture" -----------------
+def _fmt(val, missing="(inconnu)"):
+    s = str(val) if val is not None else ""
+    s = s.strip()
+    return s if s else missing
+
+def _fmt_money(x: float) -> str:
+    try:
+        return f"{round(float(x or 0.0), 2)}"
+    except Exception:
+        return "0.00"
+
+def _q_for_entry(date, lib, amt, piece, compte, suffix="Pouvez-vous nous fournir la pièce manquante ou préciser la nature de cette écriture ?"):
+    date_str = date.date().isoformat() if pd.notna(date) else "(date inconnue)"
+    lib_s = _fmt(lib, "(libellé manquant)")
+    piece_s = _fmt(piece, "(pièce absente)")
+    compte_s = _fmt(compte, "(compte inconnu)")
+    amt_s = _fmt_money(amt)
+    text = (
+        f"Écriture du {date_str} — \"{lib_s}\" — montant : {amt_s} € — pièce : {piece_s} — compte : {compte_s}. "
+        f"{suffix}"
+    )
+    upload = f"Joindre justificatif pour l'écriture du {date_str} (\"{lib_s}\", {amt_s} €, compte {compte_s})"
+    return text, upload
+
+def generate_questions_401_411_471_per_entry(
     df: pd.DataFrame,
     aging_days: int = 90,
-    top_n_per_bucket: int = 20,
-    amount_threshold: float = 0.0
+    amount_threshold: float = 0.0,
+    max_questions: int = 300
 ) -> List[Dict[str, Any]]:
     q: List[Dict[str, Any]] = []
 
@@ -134,8 +151,8 @@ def generate_questions_401_411_471(
     cDateLet   = _getcol(df, "DateLet", "LettrageDate")
     cLib       = _getcol(df, "EcritureLib", "LibelleEcriture")
 
-    # --- DIAGNOSTIC rapide ---
-    with st.expander("🔎 Diagnostic colonnes détectées"):
+    # Diagnostic (utile si entêtes exotiques)
+    with st.expander("🔎 Colonnes détectées"):
         st.write({
             "CompteNum": cCompteNum, "CompteLib": cCompteLib,
             "CompAuxNum": cCompAuxNum, "CompAuxLib": cCompAuxLib,
@@ -147,10 +164,9 @@ def generate_questions_401_411_471(
 
     # Dates & montants
     if cEcrDate:
-        # Série datetime naïve + int64
-        dt_naive = _to_naive_datetime(df[cEcrDate])
-        df[cEcrDate] = dt_naive                          # garde la version datetime naïve
-        dt_i64 = _to_i64(dt_naive)                       # version int64 pour comparaisons
+        dt_naive = _to_naive_datetime(df[cEcrDate])   # datetime naïf
+        df[cEcrDate] = dt_naive
+        dt_i64 = _to_i64(dt_naive)
         cutoff_i64 = _cutoff_i64(aging_days)
     else:
         dt_i64 = None
@@ -158,125 +174,109 @@ def generate_questions_401_411_471(
 
     amt_series = _make_amount_series(df, cDebit, cCredit)
 
-    def tier_id(row: pd.Series):
-        aux = str(row.get(cCompAuxNum, "") or "").strip() if cCompAuxNum else ""
-        auxlib = str(row.get(cCompAuxLib, "") or "").strip() if cCompAuxLib else ""
-        if aux:
-            return aux, auxlib
-        compte = str(row.get(cCompteNum, "") or "").strip() if cCompteNum else ""
-        complib = str(row.get(cCompteLib, "") or "").strip() if cCompteLib else ""
-        return compte, complib
-
-    # 1) 401/411 non lettrés anciens
+    # ---------- 1) 401/411 non lettrés ET anciens ----------
     if cCompteNum:
-        mask_tiers = _starts_with_series(df[cCompteNum], ("401","411"))
+        mask_tiers = _starts_with_series(df[cCompteNum], ("401", "411"))
         if cLet or cDateLet:
             m_unlet = _empty_series(df[cLet]) if cLet else pd.Series(True, index=df.index)
             if cDateLet:
                 m_unlet = m_unlet | df[cDateLet].isna()
         else:
             m_unlet = pd.Series(True, index=df.index)
-        # ancienneté via int64 (robuste)
         if cEcrDate and dt_i64 is not None:
-            m_date_ok = dt_i64.notna() & (dt_i64 <= cutoff_i64)
+            m_old = dt_i64.notna() & (dt_i64 <= cutoff_i64)
         else:
-            m_date_ok = pd.Series(True, index=df.index)
+            m_old = pd.Series(True, index=df.index)
         m_amt = (amt_series >= float(amount_threshold))
 
-        cand = df[mask_tiers & m_unlet & m_date_ok & m_amt].copy()
-        rows = []
+        cand = df[mask_tiers & m_unlet & m_old & m_amt].copy()
         for idx, r in cand.iterrows():
-            t_id, t_lib = tier_id(r)
-            amt = float(amt_series.loc[idx] or 0.0)
-            dt = r[cEcrDate] if cEcrDate else None
-            rows.append({"tier": t_id or "(inconnu)", "lib": t_lib, "amount": amt, "date": dt})
+            text, upload = _q_for_entry(
+                date=r[cEcrDate] if cEcrDate else None,
+                lib=r.get(cLib, ""),
+                amt=amt_series.loc[idx],
+                piece=r.get(cPieceRef, ""),
+                compte=r.get(cCompteNum, ""),
+                suffix="Merci de préciser le statut (litige, relance, avoir, plan de règlement) et de joindre la pièce si disponible."
+            )
+            q.append({"type": "texte", "question": text})
+            q.append({"type": "fichier", "question": upload})
+            if len(q) >= max_questions:
+                return q
 
-        if rows:
-            tb = pd.DataFrame(rows)
-            agg = tb.groupby(["tier","lib"], dropna=False).agg(
-                n=("amount","size"),
-                total=("amount","sum"),
-                oldest=("date","min")
-            ).reset_index()
-            agg = agg.sort_values("total", ascending=False).head(top_n_per_bucket)
-            for _, r in agg.iterrows():
-                t = r["tier"]
-                lib = r["lib"] or ""
-                tot = round(float(r["total"] or 0), 2)
-                n = int(r["n"])
-                oldest = r["oldest"]
-                oldest_str = oldest.date().isoformat() if pd.notna(oldest) else "date inconnue"
-                who = "client" if str(t).startswith("411") else "fournisseur"
-                label = (
-                    f"Postes non lettrés (> {aging_days} j) sur {who} {t} "
-                    f"{('('+lib+')' if lib else '')}: {n} écriture(s), total ~{tot}€. "
-                    f"Ancienneté depuis {oldest_str}. Indiquez le statut (litige, relance, avoir, plan de règlement)."
-                )
-                q.append({"type":"texte","question":label})
-                q.append({"type":"fichier","question":f"Joindre justificatifs (factures/relevés) pour {t} {('('+lib+')' if lib else '')}."})
-
-    # 2) 401/411 sans référence de pièce
+    # ---------- 2) 401/411 sans référence de pièce ----------
     if cCompteNum and cPieceRef:
-        mask_tiers = _starts_with_series(df[cCompteNum], ("401","411"))
+        mask_tiers = _starts_with_series(df[cCompteNum], ("401", "411"))
         m_nopic = _empty_series(df[cPieceRef])
         m_amt = (amt_series >= float(amount_threshold))
         miss = df[mask_tiers & m_nopic & m_amt].copy()
-        if len(miss):
-            rows = []
-            for idx, r in miss.iterrows():
-                t_id, t_lib = tier_id(r)
-                amt = float(amt_series.loc[idx] or 0.0)
-                rows.append({"tier": t_id or "(inconnu)","lib": t_lib, "amount": amt})
-            tb = pd.DataFrame(rows)
-            agg = tb.groupby(["tier","lib"]).agg(n=("amount","size"), total=("amount","sum")).reset_index()
-            agg = agg.sort_values("total", ascending=False).head(top_n_per_bucket)
-            for _, r in agg.iterrows():
-                t, lib, n, tot = r["tier"], r["lib"] or "", int(r["n"]), round(float(r["total"] or 0),2)
-                q.append({"type":"texte","question":f"{n} écriture(s) sur {t} {('('+lib+')' if lib else '')} sans référence de pièce. Précisez la référence (ou raison)."})
-                q.append({"type":"fichier","question":f"Joindre les pièces manquantes pour {t} {('('+lib+')' if lib else '')}."})
+        for idx, r in miss.iterrows():
+            text, upload = _q_for_entry(
+                date=r[cEcrDate] if cEcrDate else None,
+                lib=r.get(cLib, ""),
+                amt=amt_series.loc[idx],
+                piece="(pièce absente)",
+                compte=r.get(cCompteNum, ""),
+                suffix="Pouvez-vous nous fournir la pièce manquante (facture/avoir/relevé) ?"
+            )
+            q.append({"type": "texte", "question": text})
+            q.append({"type": "fichier", "question": upload})
+            if len(q) >= max_questions:
+                return q
 
-    # 3) Doublons de règlements fournisseurs
+    # ---------- 3) Doublons de règlements fournisseurs ----------
     if cCompteNum and cEcrDate:
         tmp = df[_starts_with_series(df[cCompteNum], "401")].copy()
         if not tmp.empty:
-            tmp_dt_naive = _to_naive_datetime(tmp[cEcrDate])
-            tmp_dt_i64 = _to_i64(tmp_dt_naive)
-            tmp["__date__"] = pd.to_datetime(tmp_dt_naive, errors="coerce").dt.date
+            tmp_dt = _to_naive_datetime(tmp[cEcrDate])
+            tmp["__date__"] = tmp_dt.dt.date
             amounts = _make_amount_series(tmp, _getcol(tmp, "Debit"), _getcol(tmp, "Credit"))
             tmp["__amt__"] = amounts
             tmp = tmp[tmp["__amt__"] >= float(amount_threshold)]
             tcol = _getcol(tmp, "CompAuxNum") or cCompteNum
             if tcol in tmp.columns:
                 grp = tmp.groupby([tcol, "__date__", "__amt__"]).size().reset_index(name="n")
-                dup = grp[grp["n"] >= 2].head(top_n_per_bucket)
-                for _, r in dup.iterrows():
-                    t = r[tcol]
-                    date = r["__date__"]
-                    amt = round(float(r["__amt__"] or 0),2)
-                    q.append({"type":"oui_non","question":f"Deux règlements identiques détectés pour le fournisseur {t} le {date} pour ~{amt}€. Confirmez s'il s'agit d'un doublon ?"})
-                    q.append({"type":"fichier","question":f"Joindre justificatif (relevé/annulation/avoir) concernant le doublon {t} {date} {amt}€."})
+                dup_keys = grp[grp["n"] >= 2][[tcol, "__date__", "__amt__"]]
+                if not dup_keys.empty:
+                    merged = tmp.merge(dup_keys, on=[tcol, "__date__", "__amt__"], how="inner")
+                    for _, r in merged.iterrows():
+                        text, upload = _q_for_entry(
+                            date=r[cEcrDate] if cEcrDate in r else None,
+                            lib=r.get(cLib, ""),
+                            amt=r["__amt__"],
+                            piece=r.get(cPieceRef, ""),
+                            compte=r.get(cCompteNum, ""),
+                            suffix="Deux écritures similaires détectées ce jour-là pour le même montant. Confirmez s'il s'agit d'un doublon ou fournissez l'explication (annulation/avoir)."
+                        )
+                        q.append({"type": "oui_non", "question": "S'agit-il d'un doublon ?"})
+                        q.append({"type": "texte", "question": text})
+                        q.append({"type": "fichier", "question": upload})
+                        if len(q) >= max_questions:
+                            return q
 
-    # 4) Comptes d'attente 471
+    # ---------- 4) Comptes d'attente 471 ----------
     if cCompteNum:
         ca = df[_starts_with_series(df[cCompteNum], "471")].copy()
-        if len(ca):
-            cLib = _getcol(ca, "EcritureLib", "LibelleEcriture")
-            if cLib and (cLib in ca.columns):
-                grp = ca.groupby(cLib).size().reset_index(name="n").sort_values("n", ascending=False).head(top_n_per_bucket)
-                for _, r in grp.iterrows():
-                    lib = str(r[cLib])[:120]
-                    q.append({"type":"texte","question":f"Écritures en 471 détectées (ex: '{lib}'). Précisez la nature réelle et le compte définitif."})
-                    q.append({"type":"fichier","question":f"Joindre justificatif pour l'écriture en 471 (ex: '{lib}')."})
-            else:
-                q.append({"type":"texte","question":"Écritures en 471 détectées. Précisez la nature réelle et la régularisation prévue."})
-                q.append({"type":"fichier","question":"Joindre justificatifs pour les 471."})
+        for _, r in ca.iterrows():
+            text, upload = _q_for_entry(
+                date=r[cEcrDate] if cEcrDate else None,
+                lib=r.get(cLib, ""),
+                amt=None,
+                piece=r.get(cPieceRef, ""),
+                compte=r.get(cCompteNum, ""),
+                suffix="Écriture en compte d'attente. Merci de préciser la nature réelle et le compte définitif, et de joindre tout justificatif utile."
+            )
+            q.append({"type": "texte", "question": text})
+            q.append({"type": "fichier", "question": upload})
+            if len(q) >= max_questions:
+                return q
 
     return q
 
 # ----------------- UI ADMIN -----------------
 st.set_page_config(page_title="Préparation formulaire (Admin)", page_icon="🧾", layout="centered")
 st.title("👩‍💼 Préparation du formulaire (comptable)")
-st.caption("Importer un FEC, générer des questions (401/411/471), modifier/supprimer/réordonner, puis exporter le formulaire.")
+st.caption("Importer un FEC, générer des questions par écriture (401/411/471), modifier/supprimer/réordonner, puis exporter le formulaire.")
 
 qp = st.query_params
 form_title = st.text_input("Titre du formulaire (pour l'export)", value=qp.get("title", "Formulaire client"))
@@ -284,14 +284,14 @@ form_title = st.text_input("Titre du formulaire (pour l'export)", value=qp.get("
 st.subheader("1) Importer un FEC")
 fec_file = st.file_uploader("Fichier FEC (CSV / TXT / Excel)", type=["csv", "txt", "xlsx", "xls"])
 
-st.subheader("2) Paramètres d'analyse (401/411/471)")
+st.subheader("2) Paramètres d'analyse")
 colA, colB, colC = st.columns(3)
 with colA:
-    aging = st.number_input("Ancienneté (jours) pour 401/411 non lettrés", min_value=30, max_value=365, value=90, step=15)
+    aging = st.number_input("Ancienneté (jours) pour 401/411 non lettrés", min_value=0, max_value=365, value=90, step=15)
 with colB:
     amount_thresh = st.number_input("Seuil de matérialité (montant min., €)", min_value=0.0, max_value=1_000_000.0, value=100.0, step=50.0, format="%.2f")
 with colC:
-    topn = st.number_input("Limite de questions par catégorie", min_value=5, max_value=200, value=20, step=5)
+    max_q = st.number_input("Limite totale de questions générées", min_value=10, max_value=2000, value=300, step=10)
 
 st.divider()
 
@@ -306,23 +306,24 @@ with c1:
         else:
             try:
                 df_fec = read_fec_autodetect(fec_file)
-                qs = generate_questions_401_411_471(
+                qs = generate_questions_401_411_471_per_entry(
                     df_fec,
                     aging_days=int(aging),
-                    top_n_per_bucket=int(topn),
-                    amount_threshold=float(amount_thresh)
+                    amount_threshold=float(amount_thresh),
+                    max_questions=int(max_q)
                 )
                 if not qs:
-                    st.info("Aucune question pertinente détectée (selon vos paramètres).")
+                    st.info("Aucune question générée avec ces critères.")
                 else:
                     st.session_state["questions"] = qs
-                    st.success(f"{len(qs)} question(s) générée(s). Vous pouvez maintenant modifier/supprimer/réordonner.")
+                    st.success(f"{len(qs)} question(s) générée(s). Vous pouvez modifier/supprimer/réordonner ci-dessous.")
             except Exception as e:
                 st.error(f"Erreur d'analyse du FEC: {e}")
 with c2:
     if st.button("Vider la liste"):
         st.session_state["questions"] = []
 
+# 3) Édition
 st.subheader("3) Édition du formulaire (modifier / supprimer / réordonner)")
 qs = st.session_state["questions"]
 
@@ -350,7 +351,7 @@ for i, q in enumerate(qs):
     with b1:
         q["question"] = st.text_input("Intitulé", value=q["question"], key=f"label_{i}")
     with b2:
-        q["type"] = st.selectbox("Type", SUPPORTED_TYPES, index=SUPPORTED_TYPES.index(q["type"]), key=f"type_{i}")
+        q["type"] = st.selectbox("Type", SUPPORTED_TYPES, index=SUPPORTED_TYPES.index(q.get("type","texte")), key=f"type_{i}")
     with b3:
         pos = st.number_input("Ordre", min_value=1, max_value=len(qs), value=i+1, key=f"pos_{i}")
     with b4:
@@ -376,6 +377,7 @@ if st.button("Appliquer l'ordre"):
     st.session_state["questions"] = qs
     st.success("Ordre mis à jour.")
 
+# 4) Export
 st.subheader("4) Exporter le formulaire")
 e1, e2 = st.columns(2)
 with e1:
