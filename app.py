@@ -1,7 +1,7 @@
-# app_admin.py — Admin only
-# FEC -> Génération de questions "par écriture" (401/411/471)
-# Edition (modifier/supprimer/ordre) + Export JSON/Word
-# st.query_params + dates homogénéisées, comparaisons robustes
+# app_admin.py — Admin only (FEC -> questions tabulaires par sous-compte)
+# Colonnes: N°, Date, Libellé, Question, Montant, Pièce, Statut, Sous-compte, Groupe
+# Édition via st.data_editor, suppression, renumérotation, export JSON/Excel
+# st.query_params + parsing dates robuste
 
 import os
 import json
@@ -10,38 +10,13 @@ from typing import List, Dict, Any, Optional
 
 import streamlit as st
 import pandas as pd
-from docx import Document
 
 # ----------------- Dossiers -----------------
 BASE_DIR = Path(__file__).parent
-FORMS_DIR = BASE_DIR / "forms"     # export JSON
-EXPORTS_DIR = BASE_DIR / "exports" # export Word
-FORMS_DIR.mkdir(exist_ok=True)
+EXPORTS_DIR = BASE_DIR / "exports"
 EXPORTS_DIR.mkdir(exist_ok=True)
 
-SUPPORTED_TYPES = ["oui_non", "texte", "checkbox_multi", "fichier"]
-
-# ----------------- Utils génériques -----------------
-def normalize_options(opt_str: str) -> List[str]:
-    if not isinstance(opt_str, str):
-        return []
-    return [p.strip() for p in str(opt_str).split(";") if p.strip()]
-
-def export_word(questions: List[Dict[str, Any]], title: str) -> Path:
-    doc = Document()
-    doc.add_heading(title or "Formulaire – Client", 0)
-    for i, q in enumerate(questions, start=1):
-        doc.add_paragraph(f"Q{i}. {q['question']}")
-    out = EXPORTS_DIR / f"{(title or 'formulaire').replace(' ', '_')}.docx"
-    doc.save(out)
-    return out
-
-def save_form_json(questions: List[Dict[str, Any]], filename: str) -> Path:
-    out = FORMS_DIR / f"{(filename or 'formulaire').replace(' ', '_')}.json"
-    out.write_text(json.dumps(questions, ensure_ascii=False, indent=2), encoding="utf-8")
-    return out
-
-# ----------------- FEC helpers -----------------
+# ----------------- Utils -----------------
 def _colmap(df: pd.DataFrame) -> dict:
     return {c.lower(): c for c in df.columns}
 
@@ -52,28 +27,19 @@ def _getcol(df: pd.DataFrame, *candidates: str) -> Optional[str]:
             return cmap[cand.lower()]
     return None
 
-def _starts_with_series(s: pd.Series, prefixes):
+def _starts_with(s: pd.Series, prefixes):
     if isinstance(prefixes, str):
         prefixes = (prefixes,)
     return s.astype(str).str.startswith(prefixes, na=False)
 
-def _empty_series(s: pd.Series):
+def _empty(s: pd.Series):
     return s.isna() | (s.astype(str).str.strip() == "")
 
 def _to_naive_datetime(series: pd.Series) -> pd.Series:
-    """Parse -> UTC aware -> drop tz -> naïf."""
-    s = pd.to_datetime(series, errors="coerce", utc=True)   # tz-aware
-    return s.dt.tz_localize(None)                           # drop tz => naïf
+    s = pd.to_datetime(series, errors="coerce", utc=True)
+    return s.dt.tz_localize(None)
 
-def _to_i64(series_dt_naive: pd.Series) -> pd.Series:
-    """datetime64[ns] -> int64 (ns since epoch)."""
-    return series_dt_naive.view("int64")
-
-def _cutoff_i64(days: int) -> int:
-    """Cutoff à J-<days>, début de journée UTC, en int64 ns."""
-    return (pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=days)).value
-
-def _make_amount_series(df: pd.DataFrame, cDebit: Optional[str], cCredit: Optional[str]) -> pd.Series:
+def _amount_series(df: pd.DataFrame, cDebit: Optional[str], cCredit: Optional[str]) -> pd.Series:
     def to_num(s):
         if s.dtype == object:
             s = s.str.replace(",", ".", regex=False)
@@ -90,306 +56,305 @@ def _make_amount_series(df: pd.DataFrame, cDebit: Optional[str], cCredit: Option
         return pd.Series(0.0, index=df.index)
 
 def read_fec_autodetect(uploaded_file) -> pd.DataFrame:
-    # 1) CSV auto-sep
     try:
         return pd.read_csv(uploaded_file, sep=None, engine="python", dtype=str)
     except Exception:
         try: uploaded_file.seek(0)
         except Exception: pass
-    # 2) CSV ;
     try:
         return pd.read_csv(uploaded_file, sep=";", dtype=str)
     except Exception:
         try: uploaded_file.seek(0)
         except Exception: pass
-    # 3) Excel
     return pd.read_excel(uploaded_file)
 
-# ----------------- Génération "par écriture" -----------------
-def _fmt(val, missing="(inconnu)"):
-    s = str(val) if val is not None else ""
-    s = s.strip()
+def _fmt(s, missing=""):
+    s = "" if s is None else str(s).strip()
     return s if s else missing
 
-def _fmt_money(x: float) -> str:
-    try:
-        return f"{round(float(x or 0.0), 2)}"
-    except Exception:
-        return "0.00"
+def _detect_group(compte: str) -> str:
+    if compte.startswith("401"): return "Fournisseurs (401)"
+    if compte.startswith("411"): return "Clients (411)"
+    if compte.startswith("471"): return "Comptes d'attente (471)"
+    return "Autres"
 
-def _q_for_entry(date, lib, amt, piece, compte, suffix="Pouvez-vous nous fournir la pièce manquante ou préciser la nature de cette écriture ?"):
-    date_str = date.date().isoformat() if pd.notna(date) else "(date inconnue)"
-    lib_s = _fmt(lib, "(libellé manquant)")
-    piece_s = _fmt(piece, "(pièce absente)")
-    compte_s = _fmt(compte, "(compte inconnu)")
-    amt_s = _fmt_money(amt)
-    text = (
-        f"Écriture du {date_str} — \"{lib_s}\" — montant : {amt_s} € — pièce : {piece_s} — compte : {compte_s}. "
-        f"{suffix}"
-    )
-    upload = f"Joindre justificatif pour l'écriture du {date_str} (\"{lib_s}\", {amt_s} €, compte {compte_s})"
-    return text, upload
-
-def generate_questions_401_411_471_per_entry(
+# ----------------- Génération des lignes tabulaires -----------------
+def generate_rows_tab(
     df: pd.DataFrame,
-    aging_days: int = 90,
-    amount_threshold: float = 0.0,
-    max_questions: int = 300
-) -> List[Dict[str, Any]]:
-    q: List[Dict[str, Any]] = []
-
+    aging_days: int,
+    amount_threshold: float,
+    max_rows: int
+) -> pd.DataFrame:
     # mapping colonnes
     cCompteNum = _getcol(df, "CompteNum")
-    cCompteLib = _getcol(df, "CompteLib")
     cCompAuxNum = _getcol(df, "CompAuxNum")
-    cCompAuxLib = _getcol(df, "CompAuxLib")
     cEcrDate   = _getcol(df, "EcritureDate", "DateEcriture", "EcrDate")
     cPieceRef  = _getcol(df, "PieceRef", "ReferencePiece", "RefPiece")
     cDebit     = _getcol(df, "Debit")
     cCredit    = _getcol(df, "Credit")
+    cLib       = _getcol(df, "EcritureLib", "LibelleEcriture")
     cLet       = _getcol(df, "EcritureLet", "Lettrage", "CodeLettrage")
     cDateLet   = _getcol(df, "DateLet", "LettrageDate")
-    cLib       = _getcol(df, "EcritureLib", "LibelleEcriture")
 
-    # Diagnostic (utile si entêtes exotiques)
+    # diagnostic utile
     with st.expander("🔎 Colonnes détectées"):
         st.write({
-            "CompteNum": cCompteNum, "CompteLib": cCompteLib,
-            "CompAuxNum": cCompAuxNum, "CompAuxLib": cCompAuxLib,
+            "CompteNum": cCompteNum, "CompAuxNum": cCompAuxNum,
             "EcritureDate": cEcrDate, "PieceRef": cPieceRef,
             "Debit": cDebit, "Credit": cCredit,
-            "EcritureLet": cLet, "DateLet": cDateLet,
-            "EcritureLib": cLib
+            "EcritureLib": cLib, "EcritureLet": cLet, "DateLet": cDateLet
         })
 
-    # Dates & montants
+    # dates & montants
     if cEcrDate:
-        dt_naive = _to_naive_datetime(df[cEcrDate])   # datetime naïf
-        df[cEcrDate] = dt_naive
-        dt_i64 = _to_i64(dt_naive)
-        cutoff_i64 = _cutoff_i64(aging_days)
+        df[cEcrDate] = _to_naive_datetime(df[cEcrDate])
+        dt_i64 = df[cEcrDate].view("int64")
+        cutoff_i64 = (pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=aging_days)).value
     else:
         dt_i64 = None
         cutoff_i64 = None
 
-    amt_series = _make_amount_series(df, cDebit, cCredit)
+    amt = _amount_series(df, cDebit, cCredit)
 
-    # ---------- 1) 401/411 non lettrés ET anciens ----------
+    def sous_compte(row):
+        aux = _fmt(row.get(cCompAuxNum, ""))
+        if aux: return aux
+        comp = _fmt(row.get(cCompteNum, ""))
+        return comp
+
+    rows: List[Dict[str, Any]] = []
+
+    # 1) 401/411 non lettrés & anciens
     if cCompteNum:
-        mask_tiers = _starts_with_series(df[cCompteNum], ("401", "411"))
+        mask_tiers = _starts_with(df[cCompteNum], ("401","411"))
         if cLet or cDateLet:
-            m_unlet = _empty_series(df[cLet]) if cLet else pd.Series(True, index=df.index)
-            if cDateLet:
-                m_unlet = m_unlet | df[cDateLet].isna()
+            m_unlet = _empty(df[cLet]) if cLet else pd.Series(True, index=df.index)
+            if cDateLet: m_unlet = m_unlet | df[cDateLet].isna()
         else:
             m_unlet = pd.Series(True, index=df.index)
         if cEcrDate and dt_i64 is not None:
             m_old = dt_i64.notna() & (dt_i64 <= cutoff_i64)
         else:
             m_old = pd.Series(True, index=df.index)
-        m_amt = (amt_series >= float(amount_threshold))
+        m_amt = (amt >= float(amount_threshold))
 
         cand = df[mask_tiers & m_unlet & m_old & m_amt].copy()
         for idx, r in cand.iterrows():
-            text, upload = _q_for_entry(
-                date=r[cEcrDate] if cEcrDate else None,
-                lib=r.get(cLib, ""),
-                amt=amt_series.loc[idx],
-                piece=r.get(cPieceRef, ""),
-                compte=r.get(cCompteNum, ""),
-                suffix="Merci de préciser le statut (litige, relance, avoir, plan de règlement) et de joindre la pièce si disponible."
-            )
-            q.append({"type": "texte", "question": text})
-            q.append({"type": "fichier", "question": upload})
-            if len(q) >= max_questions:
-                return q
+            sc = sous_compte(r)
+            comp = _fmt(r.get(cCompteNum, ""))
+            grp = _detect_group(comp)
+            d = r[cEcrDate].date().isoformat() if cEcrDate and pd.notna(r[cEcrDate]) else ""
+            lib = _fmt(r.get(cLib, ""))
+            piece = _fmt(r.get(cPieceRef, ""))
+            m = round(float(amt.loc[idx] or 0.0),2)
+            question = "Merci de préciser le statut (litige, relance, avoir, plan de règlement) et de joindre la pièce si disponible."
+            rows.append({
+                "Sous-compte": sc, "Groupe": grp, "Date": d, "Libellé": lib,
+                "Montant": m, "Pièce": piece, "Question": question, "Statut": ""
+            })
+            if len(rows) >= max_rows: return pd.DataFrame(rows)
 
-    # ---------- 2) 401/411 sans référence de pièce ----------
+    # 2) 401/411 sans référence de pièce
     if cCompteNum and cPieceRef:
-        mask_tiers = _starts_with_series(df[cCompteNum], ("401", "411"))
-        m_nopic = _empty_series(df[cPieceRef])
-        m_amt = (amt_series >= float(amount_threshold))
+        mask_tiers = _starts_with(df[cCompteNum], ("401","411"))
+        m_nopic = _empty(df[cPieceRef])
+        m_amt = (amt >= float(amount_threshold))
         miss = df[mask_tiers & m_nopic & m_amt].copy()
         for idx, r in miss.iterrows():
-            text, upload = _q_for_entry(
-                date=r[cEcrDate] if cEcrDate else None,
-                lib=r.get(cLib, ""),
-                amt=amt_series.loc[idx],
-                piece="(pièce absente)",
-                compte=r.get(cCompteNum, ""),
-                suffix="Pouvez-vous nous fournir la pièce manquante (facture/avoir/relevé) ?"
-            )
-            q.append({"type": "texte", "question": text})
-            q.append({"type": "fichier", "question": upload})
-            if len(q) >= max_questions:
-                return q
+            sc = sous_compte(r)
+            comp = _fmt(r.get(cCompteNum, ""))
+            grp = _detect_group(comp)
+            d = r[cEcrDate].date().isoformat() if cEcrDate and pd.notna(r[cEcrDate]) else ""
+            lib = _fmt(r.get(cLib, ""))
+            m = round(float(amt.loc[idx] or 0.0),2)
+            question = "Pièce absente : pouvez-vous nous fournir la facture/l’avoir/le relevé correspondant ?"
+            rows.append({
+                "Sous-compte": sc, "Groupe": grp, "Date": d, "Libellé": lib,
+                "Montant": m, "Pièce": "", "Question": question, "Statut": ""
+            })
+            if len(rows) >= max_rows: return pd.DataFrame(rows)
 
-    # ---------- 3) Doublons de règlements fournisseurs ----------
+    # 3) Doublons de règlements fournisseurs (401)
     if cCompteNum and cEcrDate:
-        tmp = df[_starts_with_series(df[cCompteNum], "401")].copy()
+        tmp = df[_starts_with(df[cCompteNum], "401")].copy()
         if not tmp.empty:
-            tmp_dt = _to_naive_datetime(tmp[cEcrDate])
-            tmp["__date__"] = tmp_dt.dt.date
-            amounts = _make_amount_series(tmp, _getcol(tmp, "Debit"), _getcol(tmp, "Credit"))
-            tmp["__amt__"] = amounts
+            tmp[cEcrDate] = _to_naive_datetime(tmp[cEcrDate])
+            tmp["__date__"] = tmp[cEcrDate].dt.date
+            tmp_amt = _amount_series(tmp, _getcol(tmp,"Debit"), _getcol(tmp,"Credit"))
+            tmp["__amt__"] = tmp_amt
             tmp = tmp[tmp["__amt__"] >= float(amount_threshold)]
             tcol = _getcol(tmp, "CompAuxNum") or cCompteNum
             if tcol in tmp.columns:
                 grp = tmp.groupby([tcol, "__date__", "__amt__"]).size().reset_index(name="n")
-                dup_keys = grp[grp["n"] >= 2][[tcol, "__date__", "__amt__"]]
-                if not dup_keys.empty:
-                    merged = tmp.merge(dup_keys, on=[tcol, "__date__", "__amt__"], how="inner")
+                keys = grp[grp["n"] >= 2][[tcol, "__date__", "__amt__"]]
+                if not keys.empty:
+                    merged = tmp.merge(keys, on=[tcol, "__date__", "__amt__"], how="inner")
                     for _, r in merged.iterrows():
-                        text, upload = _q_for_entry(
-                            date=r[cEcrDate] if cEcrDate in r else None,
-                            lib=r.get(cLib, ""),
-                            amt=r["__amt__"],
-                            piece=r.get(cPieceRef, ""),
-                            compte=r.get(cCompteNum, ""),
-                            suffix="Deux écritures similaires détectées ce jour-là pour le même montant. Confirmez s'il s'agit d'un doublon ou fournissez l'explication (annulation/avoir)."
-                        )
-                        q.append({"type": "oui_non", "question": "S'agit-il d'un doublon ?"})
-                        q.append({"type": "texte", "question": text})
-                        q.append({"type": "fichier", "question": upload})
-                        if len(q) >= max_questions:
-                            return q
+                        sc = _fmt(r.get(tcol,""))
+                        comp = _fmt(r.get(cCompteNum,""))
+                        d = r["__date__"].isoformat() if pd.notna(r["__date__"]) else ""
+                        lib = _fmt(r.get(cLib,""))
+                        m = round(float(r["__amt__"] or 0.0),2)
+                        question = "Deux écritures similaires détectées (même date & montant). Confirmez si doublon ou précisez l’explication (annulation/avoir)."
+                        rows.append({
+                            "Sous-compte": sc, "Groupe": "Fournisseurs (401)", "Date": d, "Libellé": lib,
+                            "Montant": m, "Pièce": _fmt(r.get(cPieceRef,"")), "Question": question, "Statut": ""
+                        })
+                        if len(rows) >= max_rows: return pd.DataFrame(rows)
 
-    # ---------- 4) Comptes d'attente 471 ----------
+    # 4) Comptes d’attente 471 (toutes écritures)
     if cCompteNum:
-        ca = df[_starts_with_series(df[cCompteNum], "471")].copy()
+        ca = df[_starts_with(df[cCompteNum], "471")].copy()
         for _, r in ca.iterrows():
-            text, upload = _q_for_entry(
-                date=r[cEcrDate] if cEcrDate else None,
-                lib=r.get(cLib, ""),
-                amt=None,
-                piece=r.get(cPieceRef, ""),
-                compte=r.get(cCompteNum, ""),
-                suffix="Écriture en compte d'attente. Merci de préciser la nature réelle et le compte définitif, et de joindre tout justificatif utile."
-            )
-            q.append({"type": "texte", "question": text})
-            q.append({"type": "fichier", "question": upload})
-            if len(q) >= max_questions:
-                return q
+            sc = _fmt(r.get(cCompAuxNum,"")) or _fmt(r.get(cCompteNum,""))
+            d = ""
+            if cEcrDate and pd.notna(r.get(cEcrDate,None)):
+                d = r[cEcrDate].date().isoformat()
+            lib = _fmt(r.get(cLib,""))
+            piece = _fmt(r.get(cPieceRef,""))
+            question = "Écriture en 471 : merci de préciser la nature réelle et le compte définitif, et de joindre le justificatif."
+            rows.append({
+                "Sous-compte": sc, "Groupe": "Comptes d'attente (471)", "Date": d, "Libellé": lib,
+                "Montant": "", "Pièce": piece, "Question": question, "Statut": ""
+            })
+            if len(rows) >= max_rows: return pd.DataFrame(rows)
 
-    return q
+    return pd.DataFrame(rows)
 
-# ----------------- UI ADMIN -----------------
-st.set_page_config(page_title="Préparation formulaire (Admin)", page_icon="🧾", layout="centered")
+def renumeroter(dfq: pd.DataFrame, par_sous_compte: bool) -> pd.DataFrame:
+    dfq = dfq.copy()
+    if par_sous_compte:
+        dfq["N°"] = (
+            dfq.sort_values(["Groupe","Sous-compte","Date","Libellé"])
+               .groupby(["Groupe","Sous-compte"])
+               .cumcount() + 1
+        )
+    else:
+        dfq = dfq.sort_values(["Groupe","Sous-compte","Date","Libellé"]).reset_index(drop=True)
+        dfq["N°"] = dfq.index + 1
+    return dfq
+
+# ----------------- UI -----------------
+st.set_page_config(page_title="Préparation formulaire (Admin)", page_icon="🧾", layout="wide")
 st.title("👩‍💼 Préparation du formulaire (comptable)")
-st.caption("Importer un FEC, générer des questions par écriture (401/411/471), modifier/supprimer/réordonner, puis exporter le formulaire.")
+st.caption("Importer un FEC → Générer des questions → Modifier/Supprimer → Organiser par sous-compte → Export JSON/Excel")
 
 qp = st.query_params
-form_title = st.text_input("Titre du formulaire (pour l'export)", value=qp.get("title", "Formulaire client"))
+titre = st.text_input("Titre du formulaire (pour l'export)", value=qp.get("title", "Formulaire client"))
 
 st.subheader("1) Importer un FEC")
-fec_file = st.file_uploader("Fichier FEC (CSV / TXT / Excel)", type=["csv", "txt", "xlsx", "xls"])
+fec_file = st.file_uploader("Fichier FEC (CSV / TXT / Excel)", type=["csv","txt","xlsx","xls"])
 
-st.subheader("2) Paramètres d'analyse")
-colA, colB, colC = st.columns(3)
-with colA:
+st.subheader("2) Paramètres d’analyse")
+c1, c2, c3, c4 = st.columns(4)
+with c1:
     aging = st.number_input("Ancienneté (jours) pour 401/411 non lettrés", min_value=0, max_value=365, value=90, step=15)
-with colB:
-    amount_thresh = st.number_input("Seuil de matérialité (montant min., €)", min_value=0.0, max_value=1_000_000.0, value=100.0, step=50.0, format="%.2f")
-with colC:
-    max_q = st.number_input("Limite totale de questions générées", min_value=10, max_value=2000, value=300, step=10)
+with c2:
+    seuil = st.number_input("Seuil de matérialité (montant min. €)", min_value=0.0, max_value=1_000_000.0, value=100.0, step=50.0, format="%.2f")
+with c3:
+    max_rows = st.number_input("Nombre max. de lignes générées", min_value=10, max_value=10000, value=2000, step=50)
+with c4:
+    renum_par_sc = st.checkbox("Renuméroter par sous-compte", value=True)
 
 st.divider()
 
-if "questions" not in st.session_state:
-    st.session_state["questions"] = []
+if "dfq" not in st.session_state:
+    st.session_state["dfq"] = pd.DataFrame()
 
-c1, c2 = st.columns([1,1])
-with c1:
-    if st.button("Analyser le FEC et générer des questions"):
+b1, b2 = st.columns([1,1])
+with b1:
+    if st.button("Analyser le FEC et générer"):
         if fec_file is None:
             st.warning("Veuillez importer un FEC.")
         else:
             try:
                 df_fec = read_fec_autodetect(fec_file)
-                qs = generate_questions_401_411_471_per_entry(
-                    df_fec,
-                    aging_days=int(aging),
-                    amount_threshold=float(amount_thresh),
-                    max_questions=int(max_q)
-                )
-                if not qs:
-                    st.info("Aucune question générée avec ces critères.")
+                dfq = generate_rows_tab(df_fec, aging_days=int(aging), amount_threshold=float(seuil), max_rows=int(max_rows))
+                if dfq.empty:
+                    st.info("Aucune ligne générée avec ces critères.")
                 else:
-                    st.session_state["questions"] = qs
-                    st.success(f"{len(qs)} question(s) générée(s). Vous pouvez modifier/supprimer/réordonner ci-dessous.")
+                    dfq = renumeroter(dfq, par_sous_compte=renum_par_sc)
+                    # ordre colonnes
+                    cols = ["N°","Date","Libellé","Question","Montant","Pièce","Statut","Sous-compte","Groupe"]
+                    for c in cols:
+                        if c not in dfq.columns: dfq[c] = ""
+                    st.session_state["dfq"] = dfq[cols]
+                    st.success(f"{len(dfq)} ligne(s) prête(s). Vous pouvez éditer/supprimer ci-dessous.")
             except Exception as e:
                 st.error(f"Erreur d'analyse du FEC: {e}")
-with c2:
-    if st.button("Vider la liste"):
-        st.session_state["questions"] = []
+with b2:
+    if st.button("Vider"):
+        st.session_state["dfq"] = pd.DataFrame()
 
-# 3) Édition
-st.subheader("3) Édition du formulaire (modifier / supprimer / réordonner)")
-qs = st.session_state["questions"]
+st.subheader("3) Édition et organisation par sous-compte")
 
-with st.expander("➕ Ajouter une question manuellement"):
-    a1, a2 = st.columns([2,1])
-    with a1:
-        new_label = st.text_input("Texte de la question", key="new_label_admin")
-    with a2:
-        new_type = st.selectbox("Type", SUPPORTED_TYPES, key="new_type_admin")
-    new_opts_str = st.text_input("Options (séparées par ';') pour checkbox_multi", key="new_opts_admin")
-    if st.button("Ajouter la question manuelle"):
-        q = {"type": new_type, "question": new_label.strip() if new_label else "", "options": normalize_options(new_opts_str)}
-        if q["question"]:
-            qs.append(q)
-            st.session_state["questions"] = qs
-            st.success("Question ajoutée.")
-        else:
-            st.warning("Le texte de la question est vide.")
+dfq = st.session_state["dfq"]
+if not dfq.empty:
+    # tri par Groupe/Sous-compte/Date
+    dfq = dfq.sort_values(["Groupe","Sous-compte","Date","Libellé"], na_position="last")
+    st.session_state["dfq"] = dfq
 
-to_delete = []
-reordered = []
-for i, q in enumerate(qs):
-    st.markdown(f"**Q{i+1}**")
-    b1, b2, b3, b4 = st.columns([4,2,1,1])
-    with b1:
-        q["question"] = st.text_input("Intitulé", value=q["question"], key=f"label_{i}")
-    with b2:
-        q["type"] = st.selectbox("Type", SUPPORTED_TYPES, index=SUPPORTED_TYPES.index(q.get("type","texte")), key=f"type_{i}")
-    with b3:
-        pos = st.number_input("Ordre", min_value=1, max_value=len(qs), value=i+1, key=f"pos_{i}")
-    with b4:
-        if st.button("🗑️", key=f"del_{i}", help="Supprimer cette question"):
-            to_delete.append(i)
+    # Affichage groupé par sous-compte
+    for (grp, sc), df_sub in dfq.groupby(["Groupe","Sous-compte"], sort=False):
+        with st.expander(f"{grp} — Sous-compte {sc}  ({len(df_sub)} lignes)", expanded=False):
+            # Ajouter colonne suppression (locale à l’éditeur)
+            df_edit = df_sub.copy()
+            df_edit["Supprimer"] = False
 
-    if q["type"] == "checkbox_multi":
-        opt_str = "; ".join(q.get("options", []))
-        new_opt_str = st.text_input("Options (; séparées)", value=opt_str, key=f"opts_{i}")
-        q["options"] = normalize_options(new_opt_str)
+            edited = st.data_editor(
+                df_edit,
+                num_rows="dynamic",
+                use_container_width=True,
+                column_config={
+                    "N°": st.column_config.NumberColumn("N°", width="small"),
+                    "Date": st.column_config.TextColumn("Date", help="AAAA-MM-JJ"),
+                    "Libellé": st.column_config.TextColumn("Libellé"),
+                    "Question": st.column_config.TextColumn("Question"),
+                    "Montant": st.column_config.NumberColumn("Montant", step=0.01),
+                    "Pièce": st.column_config.TextColumn("Pièce"),
+                    "Statut": st.column_config.TextColumn("Statut", help="litige / relance / avoir / plan de règlement / ..."),
+                    "Sous-compte": st.column_config.TextColumn("Sous-compte", width="small"),
+                    "Groupe": st.column_config.TextColumn("Groupe", width="small"),
+                    "Supprimer": st.column_config.CheckboxColumn("🗑️", help="Cocher pour supprimer"),
+                },
+                hide_index=True,
+                key=f"editor_{grp}_{sc}"
+            )
 
-    reordered.append((pos, q))
+            # Appliquer modifications de ce sous-compte
+            if st.button(f"Appliquer modifications — {grp} / {sc}", key=f"apply_{grp}_{sc}"):
+                # fusion : on remplace les lignes correspondantes par edited (hors Supprimer cochés)
+                keep_mask = ~((st.session_state["dfq"]["Groupe"] == grp) & (st.session_state["dfq"]["Sous-compte"] == sc))
+                remain = st.session_state["dfq"][keep_mask]
+                edited_clean = edited[edited["Supprimer"] != True].drop(columns=["Supprimer"], errors="ignore")
+                st.session_state["dfq"] = pd.concat([remain, edited_clean], ignore_index=True)
+                # renumérotation si demandé
+                st.session_state["dfq"] = renumeroter(st.session_state["dfq"], par_sous_compte=renum_par_sc)
+                st.success("Modifications appliquées.")
 
-if to_delete:
-    for idx in sorted(to_delete, reverse=True):
-        qs.pop(idx)
-    st.session_state["questions"] = qs
-    st.rerun()
+    st.divider()
+    if st.button("Renuméroter maintenant"):
+        st.session_state["dfq"] = renumeroter(st.session_state["dfq"], par_sous_compte=renum_par_sc)
+        st.success("Renumérotation effectuée.")
 
-if st.button("Appliquer l'ordre"):
-    reordered.sort(key=lambda x: x[0])
-    qs = [q for _, q in reordered]
-    st.session_state["questions"] = qs
-    st.success("Ordre mis à jour.")
-
-# 4) Export
-st.subheader("4) Exporter le formulaire")
-e1, e2 = st.columns(2)
-with e1:
-    if st.button("Exporter en JSON"):
-        p = save_form_json(st.session_state["questions"], filename=qp.get("title", "Formulaire client"))
-        with open(p, "rb") as fh:
-            st.download_button("Télécharger le JSON", fh, file_name=p.name)
-with e2:
-    if st.button("Exporter en Word"):
-        if not st.session_state["questions"]:
-            st.warning("Pas de questions à exporter.")
-        else:
-            p = export_word(st.session_state["questions"], title=qp.get("title", "Formulaire client"))
-            with open(p, "rb") as fh:
-                st.download_button("Télécharger le .docx", fh, file_name=p.name)
+    st.subheader("4) Export")
+    colx, coly = st.columns(2)
+    with colx:
+        if st.button("Exporter en JSON"):
+            out = EXPORTS_DIR / f"{titre.replace(' ','_')}.json"
+            st.session_state["dfq"].to_json(out, orient="records", force_ascii=False, indent=2)
+            with open(out, "rb") as fh:
+                st.download_button("Télécharger le JSON", fh, file_name=out.name)
+    with coly:
+        if st.button("Exporter en Excel"):
+            out = EXPORTS_DIR / f"{titre.replace(' ','_')}.xlsx"
+            with pd.ExcelWriter(out, engine="openpyxl") as writer:
+                # Feuille par groupe pour lisibilité
+                for grp, df_grp in st.session_state["dfq"].groupby("Groupe"):
+                    df_grp.to_excel(writer, sheet_name=grp[:31], index=False)
+                # Feuille 'Tout'
+                st.session_state["dfq"].to_excel(writer, sheet_name="Tout", index=False)
+            with open(out, "rb") as fh:
+                st.download_button("Télécharger l'Excel", fh, file_name=out.name)
+else:
+    st.info("Aucune ligne à afficher. Importez un FEC et cliquez sur « Analyser le FEC et générer ».") 
