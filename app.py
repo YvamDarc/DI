@@ -278,9 +278,11 @@ def generate_questions_401_411_471(
 
 st.set_page_config(page_title="Form System", page_icon="🧾", layout="centered")
 
-query = st.experimental_get_query_params()
-role = query.get("role", ["client"])[0]  # default client
-client_id = query.get("client", ["anonyme"])[0]
+# ✅ Nouveau : API moderne
+qp = st.query_params  # dict-like
+role = qp.get("role", "client")        # "admin" ou "client"
+client_id = qp.get("client", "anonyme")
+
 
 if role == "admin":
     st.title("👩‍💼 Admin – Création & publication de formulaires")
