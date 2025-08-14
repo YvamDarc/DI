@@ -13,6 +13,9 @@ from typing import List, Dict, Any, Optional
 import streamlit as st
 import pandas as pd
 
+from docx import Document
+from docx.shared import Pt
+
 # ----------------- Dossiers -----------------
 BASE_DIR = Path(__file__).parent
 EXPORTS_DIR = BASE_DIR / "exports"
@@ -309,7 +312,68 @@ def renumeroter(dfq: pd.DataFrame, par_sous_compte: bool) -> pd.DataFrame:
         dfq["N°"] = dfq.index + 1
     return dfq
 
+def export_word(dfq: pd.DataFrame, titre_formulaire: str):
+    """Exporte le tableau des questions vers un document Word clair et synthétique."""
+    doc = Document()
+    doc.add_heading(f"Demande d'informations – {titre_formulaire}", 0)
+
+    # Boucle par Groupe puis Sous-compte
+    for (grp, sc), df_sub in dfq.groupby(["Groupe", "Sous-compte"], sort=False):
+        doc.add_heading(f"{grp} – Sous-compte {sc}", level=1)
+        for _, row in df_sub.iterrows():
+            date_str = row["Date"] if pd.notna(row["Date"]) else "(date inconnue)"
+            lib = row["Libellé"]
+            montant = f"{row['Montant']:.2f} €" if row["Montant"] not in ("", None) else ""
+            piece = row["Pièce"] if row["Pièce"] else "(pièce absente)"
+            question = row["Question"]
+
+            p = doc.add_paragraph()
+            p.add_run(f"Écriture du {date_str} — {lib} — montant : {montant} — pièce : {piece}\n").bold = True
+            doc.add_paragraph(question)
+
+    out_path = EXPORTS_DIR / f"{titre_formulaire.replace(' ','_')}.docx"
+    doc.save(out_path)
+    return out_path
+
+def export_json_for_client(dfq: pd.DataFrame, client_id: str):
+    """Exporte un JSON structuré pour utilisation dans l'appli client."""
+    data = {
+        "client_id": client_id,
+        "questions": []
+    }
+    for _, row in dfq.iterrows():
+        data["questions"].append({
+            "numero": row.get("N°", ""),
+            "date": row.get("Date", ""),
+            "libelle": row.get("Libellé", ""),
+            "montant": row.get("Montant", ""),
+            "piece": row.get("Pièce", ""),
+            "question": row.get("Question", ""),
+            "sous_compte": row.get("Sous-compte", ""),
+            "groupe": row.get("Groupe", ""),
+            "type": "mixte"  # mixte = réponse texte + upload fichier
+        })
+    out_path = EXPORTS_DIR / f"{client_id}_questions.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return out_path
+
 # ----------------- UI -----------------
+colz1, colz2 = st.columns(2)
+with colz1:
+    if st.button("📄 Exporter en Word"):
+        if not dfq.empty:
+            path_word = export_word(dfq, titre)
+            with open(path_word, "rb") as fh:
+                st.download_button("Télécharger le Word", fh, file_name=path_word.name)
+with colz2:
+    client_id_export = st.text_input("Identifiant client pour export JSON", value="client_demo")
+    if st.button("💾 Export JSON pour client"):
+        if not dfq.empty:
+            path_json = export_json_for_client(dfq, client_id_export)
+            with open(path_json, "rb") as fh:
+                st.download_button("Télécharger JSON client", fh, file_name=path_json.name)
+
 st.set_page_config(page_title="Préparation formulaire (Admin)", page_icon="🧾", layout="wide")
 st.title("👩‍💼 Préparation du formulaire (comptable)")
 st.caption("Importer un FEC → Générer des questions → Modifier/Supprimer → Organiser par sous-compte → Export JSON/Excel")
